@@ -1,0 +1,42 @@
+# Lokale Entwicklung:
+#   docker compose up -d mysql        → nur die Datenbank, Server per `npm run dev`
+#   docker compose up --build         → Datenbank + Server mit Web-App auf http://localhost:8080
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: antatime
+      MYSQL_USER: antatime
+      MYSQL_PASSWORD: antatime
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uantatime", "-pantatime"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  server:
+    build:
+      context: .
+      # Die Web-App wird im Image aus dem App-Projekt gebaut.
+      additional_contexts:
+        app: ../antatime-app
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: antatime
+      DB_PASSWORD: antatime
+      DB_NAME: antatime
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  mysql-data:

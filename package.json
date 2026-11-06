@@ -1,0 +1,30 @@
+{
+  "name": "antatime-server",
+  "version": "1.0.0",
+  "description": "Ende-zu-Ende-verschlüsselter Sync-Server für AnTaTime",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=26"
+  },
+  "bin": {
+    "antatime-server": "dist/antatime-server.cjs"
+  },
+  "scripts": {
+    "dev": "node --watch --env-file-if-exists=.env src/main.ts",
+    "start": "node dist/antatime-server.cjs",
+    "build": "node build.mjs",
+    "typecheck": "tsc",
+    "test": "node --test test/*.test.ts"
+  },
+  "dependencies": {
+    "mysql2": "^3.24.6",
+    "ws": "^8.22.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/ws": "^8.18.2",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}
