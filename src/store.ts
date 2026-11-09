@@ -1,10 +1,14 @@
 import { ErrorCode, ProtocolError } from './protocol.ts';
 import type { SyncRecord, StoredRecord } from './protocol.ts';
 
-/** Speicher-Kontingent pro Vault, 0 = unbegrenzt. */
+/** Speicher-Kontingent, 0 = unbegrenzt. */
 export interface Quota {
+  /** pro Vault */
   maxRecords: number;
+  /** pro Vault */
   maxBytes: number;
+  /** über alle Vaults des Servers */
+  maxTotalBytes: number;
 }
 
 export interface Usage {
@@ -23,6 +27,7 @@ export function applyQuota(
   existing: Map<string, number>,
   records: SyncRecord[],
   quota: Quota,
+  totalBytes: number,
 ): Usage {
   const latest = new Map<string, number>();
   for (const r of records) latest.set(r.key.toString('hex'), r.data.length);
@@ -40,6 +45,9 @@ export function applyQuota(
   ) {
     throw new ProtocolError(ErrorCode.quotaExceeded, 'Speicherplatz für diesen Sync-Code ist voll');
   }
+  if (quota.maxTotalBytes > 0 && delta > 0 && totalBytes + delta > quota.maxTotalBytes) {
+    throw new ProtocolError(ErrorCode.quotaExceeded, 'Speicherplatz des Servers ist voll');
+  }
   return next;
 }
 
@@ -50,6 +58,14 @@ export interface Store {
   /** Erste vergebene Sequenznummer, `null` wenn der Vault gelöscht ist. */
   put(vault: Buffer, records: SyncRecord[], quota: Quota): Promise<number | null>;
   deleteVault(vault: Buffer): Promise<void>;
+  /** Merkt sich, dass ein Gerät den Vault gerade benutzt. */
+  touch(vault: Buffer): Promise<void>;
+  /**
+   * Entfernt Vaults (auch gelöschte), die seit [before] nicht benutzt wurden,
+   * vollständig. Kommt ein Gerät später zurück, lädt es seine Daten neu hoch.
+   * Gibt die Zahl der entfernten Vaults zurück.
+   */
+  expire(before: Date): Promise<number>;
   ping(): Promise<void>;
   close(): Promise<void>;
 }
@@ -58,6 +74,7 @@ interface MemoryVault {
   seq: number;
   deleted: boolean;
   records: Map<string, StoredRecord>;
+  activeAt: number;
 }
 
 /** Flüchtiger Speicher – für Tests und schnelles Ausprobieren ohne Datenbank. */
@@ -68,7 +85,7 @@ export class MemoryStore implements Store {
     const k = id.toString('hex');
     let v = this.vaults.get(k);
     if (!v) {
-      v = { seq: 0, deleted: false, records: new Map() };
+      v = { seq: 0, deleted: false, records: new Map(), activeAt: Date.now() };
       this.vaults.set(k, v);
     }
     return v;
@@ -97,7 +114,10 @@ export class MemoryStore implements Store {
       existing.set(k, r.data.length);
       bytes += r.data.length;
     }
-    applyQuota({ records: v.records.size, bytes }, existing, records, quota);
+    let total = 0;
+    for (const o of this.vaults.values()) for (const r of o.records.values()) total += r.data.length;
+    applyQuota({ records: v.records.size, bytes }, existing, records, quota, total);
+    v.activeAt = Date.now();
     const first = v.seq + 1;
     for (const r of records) {
       v.seq++;
@@ -110,6 +130,23 @@ export class MemoryStore implements Store {
     const v = this.vault(id);
     v.deleted = true;
     v.records.clear();
+    v.activeAt = Date.now();
+  }
+
+  async touch(id: Buffer) {
+    const v = this.vaults.get(id.toString('hex'));
+    if (v) v.activeAt = Date.now();
+  }
+
+  async expire(before: Date) {
+    let n = 0;
+    for (const [k, v] of this.vaults) {
+      if (v.activeAt < before.getTime()) {
+        this.vaults.delete(k);
+        n++;
+      }
+    }
+    return n;
   }
 
   async ping() {}

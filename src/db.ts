@@ -15,7 +15,9 @@ const SCHEMA = [
      bytes      BIGINT UNSIGNED NOT NULL DEFAULT 0,
      created_at TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
      updated_at TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-     PRIMARY KEY (id)
+     active_at  TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (id),
+     KEY by_active (active_at)
    ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS records (
      vault BINARY(32)      NOT NULL,
@@ -28,8 +30,15 @@ const SCHEMA = [
    ) ENGINE=InnoDB`,
 ];
 
+/** So lange gilt die zwischengespeicherte Gesamtbelegung des Servers. */
+const TOTAL_TTL_MS = 10_000;
+/** Vaults pro Lösch-Durchgang beim Ablauf. */
+const EXPIRE_BATCH = 500;
+
 export class Database implements Store {
   private readonly pool: Pool;
+  /** Gesamtbelegung aller Vaults; zwischen zwei Abfragen fortgeschrieben. */
+  private total: { bytes: number; at: number } | null = null;
 
   constructor(config: DbConfig) {
     this.pool = mysql.createPool({
@@ -60,12 +69,23 @@ export class Database implements Store {
     }
   }
 
-  /** Ältere Datenbanken: Spalten für das Kontingent ergänzen und befüllen. */
+  /** Ältere Datenbanken: fehlende Spalten ergänzen und befüllen. */
   private async migrate(): Promise<void> {
     const [cols] = await this.pool.query<RowDataPacket[]>(
-      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'vaults' AND COLUMN_NAME = 'bytes'",
+      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'vaults'",
     );
-    if (cols.length) return;
+    const have = new Set(cols.map((c) => String(c['COLUMN_NAME']).toLowerCase()));
+    if (!have.has('bytes')) await this.migrateQuota();
+    if (!have.has('active_at')) {
+      console.log('Datenbank: ergänze Spalte für den Ablauf inaktiver Vaults …');
+      await this.pool.query(
+        'ALTER TABLE vaults ADD COLUMN active_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, ADD KEY by_active (active_at)',
+      );
+      await this.pool.query('UPDATE vaults SET active_at = updated_at, updated_at = updated_at');
+    }
+  }
+
+  private async migrateQuota(): Promise<void> {
     console.log('Datenbank: ergänze Kontingent-Spalten …');
     await this.pool.query(
       'ALTER TABLE vaults ADD COLUMN records INT UNSIGNED NOT NULL DEFAULT 0 AFTER deleted, ' +
@@ -75,6 +95,16 @@ export class Database implements Store {
       'UPDATE vaults v JOIN (SELECT vault, COUNT(*) AS n, SUM(LENGTH(data)) AS b FROM records GROUP BY vault) r ' +
         'ON r.vault = v.id SET v.records = r.n, v.bytes = r.b',
     );
+  }
+
+  /** Gesamtbelegung aller Vaults, höchstens [TOTAL_TTL_MS] alt. */
+  private async totalBytes(): Promise<number> {
+    const now = Date.now();
+    if (!this.total || now - this.total.at > TOTAL_TTL_MS) {
+      const [rows] = await this.pool.query<RowDataPacket[]>('SELECT COALESCE(SUM(bytes), 0) AS b FROM vaults');
+      this.total = { bytes: Number(rows[0]!['b']), at: now };
+    }
+    return this.total.bytes;
   }
 
   async ping(): Promise<void> {
@@ -110,6 +140,7 @@ export class Database implements Store {
    */
   async put(vault: Buffer, records: SyncRecord[], quota: Quota): Promise<number | null> {
     const n = records.length;
+    const total = quota.maxTotalBytes > 0 ? await this.totalBytes() : 0;
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
@@ -133,9 +164,10 @@ export class Database implements Store {
         existing,
         records,
         quota,
+        total,
       );
       const first = Number(head['seq']) + 1;
-      await conn.query('UPDATE vaults SET seq = ?, records = ?, bytes = ? WHERE id = ?', [
+      await conn.query('UPDATE vaults SET seq = ?, records = ?, bytes = ?, active_at = NOW() WHERE id = ?', [
         first + n - 1,
         usage.records,
         usage.bytes,
@@ -148,6 +180,7 @@ export class Database implements Store {
         [values],
       );
       await conn.commit();
+      if (this.total) this.total.bytes += usage.bytes - Number(head['bytes']);
       return first;
     } catch (e) {
       await conn.rollback().catch(() => {});
@@ -169,7 +202,7 @@ export class Database implements Store {
       await conn.query('DELETE FROM records WHERE vault = ?', [vault]);
       await conn.query(
         'INSERT INTO vaults (id, deleted) VALUES (?, TRUE) ' +
-          'ON DUPLICATE KEY UPDATE deleted = TRUE, records = 0, bytes = 0',
+          'ON DUPLICATE KEY UPDATE deleted = TRUE, records = 0, bytes = 0, active_at = NOW()',
         [vault],
       );
       await conn.commit();
@@ -179,6 +212,53 @@ export class Database implements Store {
     } finally {
       conn.release();
     }
+  }
+
+  async touch(vault: Buffer): Promise<void> {
+    // Höchstens einmal pro Stunde schreiben, sonst kostet jedes HELLO ein UPDATE.
+    await this.pool.query(
+      'UPDATE vaults SET active_at = NOW() WHERE id = ? AND active_at < NOW() - INTERVAL 1 HOUR',
+      [vault],
+    );
+  }
+
+  async expire(before: Date): Promise<number> {
+    // Relativ zu NOW() rechnen: Ein Date-Parameter würde in der Zeitzone von
+    // Node übergeben, verglichen wird aber in der Zeitzone der Datenbank.
+    const age = Math.round((Date.now() - before.getTime()) / 1000);
+    let removed = 0;
+    for (;;) {
+      const [rows] = await this.pool.query<RowDataPacket[]>(
+        'SELECT id FROM vaults WHERE active_at < NOW() - INTERVAL ? SECOND LIMIT ?',
+        [age, EXPIRE_BATCH],
+      );
+      if (!rows.length) break;
+      for (const row of rows) {
+        // Einzeln und erneut geprüft: Ein Gerät kann sich inzwischen gemeldet haben.
+        const conn = await this.pool.getConnection();
+        try {
+          await conn.beginTransaction();
+          const [hit] = await conn.query<RowDataPacket[]>(
+            'SELECT id FROM vaults WHERE id = ? AND active_at < NOW() - INTERVAL ? SECOND FOR UPDATE',
+            [row['id'], age],
+          );
+          if (hit.length) {
+            await conn.query('DELETE FROM records WHERE vault = ?', [row['id']]);
+            await conn.query('DELETE FROM vaults WHERE id = ?', [row['id']]);
+            removed++;
+          }
+          await conn.commit();
+        } catch (e) {
+          await conn.rollback().catch(() => {});
+          throw e;
+        } finally {
+          conn.release();
+        }
+      }
+      if (rows.length < EXPIRE_BATCH) break;
+    }
+    if (removed) this.total = null;
+    return removed;
   }
 
   async close(): Promise<void> {

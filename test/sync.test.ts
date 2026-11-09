@@ -409,6 +409,56 @@ describe('Limits pro IP', () => {
     }
   });
 
+  test('Kontingent über alle Vaults', async () => {
+    const { server, port } = await start({ messagesPerSecond: 1000, maxTotalBytes: 10 });
+    try {
+      const a = await Client.connect(port);
+      await a.hello(randomBytes(16));
+      a.send(encodePush(1, [rec(1, 'aaaaaa')]));
+      await a.until((m) => m.op === 'ack');
+      const b = await Client.connect(port);
+      await b.hello(randomBytes(16));
+      b.send(encodePush(1, [rec(1, 'bbbbbb')]));
+      const [err] = await b.until((m) => m.op === 'error');
+      assert.equal(err?.op === 'error' && err.code, 7);
+      assert.match(err?.op === 'error' ? err.message : '', /Servers/);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('unbenutzte Vaults und Tombstones laufen ab', async () => {
+    const store = new MemoryStore();
+    const server = new SyncServer({ ...loadConfig({}), messagesPerSecond: 1000, vaultTtlDays: 0 }, store);
+    const port = await server.listen(0, '127.0.0.1');
+    try {
+      const used = randomBytes(16);
+      const gone = randomBytes(16);
+      const a = await Client.connect(port);
+      await a.hello(used);
+      a.send(encodePush(1, [rec(1, 'eins')]));
+      await a.until((m) => m.op === 'ack');
+      const b = await Client.connect(port);
+      await b.hello(gone);
+      b.send(encodePush(1, [rec(1, 'x')]));
+      await b.until((m) => m.op === 'ack');
+      b.send(Buffer.from([Op.deleteVault]));
+      await b.until((m) => m.op === 'deleted');
+
+      assert.equal(await store.expire(new Date(Date.now() - 60_000)), 0);
+      assert.equal(await store.expire(new Date(Date.now() + 60_000)), 2);
+
+      // Ein zurückkehrendes Gerät sieht einen leeren Vault und lädt neu hoch.
+      const c = await Client.connect(port);
+      assert.deepEqual(await c.hello(used, 1), [{ op: 'synced', head: 0 }]);
+      // Der Tombstone ist weg, der Code wieder verwendbar.
+      const d = await Client.connect(port);
+      assert.deepEqual(await d.hello(gone, 0), [{ op: 'synced', head: 0 }]);
+    } finally {
+      await server.close();
+    }
+  });
+
   test('ohne HELLO wird getrennt', async () => {
     const { server, port } = await start({ helloTimeoutMs: 100 });
     try {

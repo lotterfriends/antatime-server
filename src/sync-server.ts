@@ -29,6 +29,8 @@ const CATCH_UP_CHUNK = 500;
 /** Obergrenze einer CHANGES-Nachricht beim Nachholen (mindestens ein Datensatz). */
 const CATCH_UP_FRAME_BYTES = 1024 * 1024;
 const HEARTBEAT_MS = 30_000;
+/** Wie oft abgelaufene Vaults entfernt werden. */
+const EXPIRE_EVERY_MS = 60 * 60 * 1000;
 
 /**
  * Die Vault-ID wird nur gehasht gespeichert: Wer die Datenbank liest, kann
@@ -82,6 +84,8 @@ export class SyncServer {
   private readonly http: Server;
   private readonly wss: WebSocketServer;
   private heartbeat: NodeJS.Timeout | undefined;
+  private expiry: NodeJS.Timeout | undefined;
+  private expiring: Promise<void> | null = null;
   private readonly config: Config;
   private readonly store: Store;
 
@@ -150,6 +154,11 @@ export class SyncServer {
           this.checkAlive();
           this.ipLimits.sweep();
         }, HEARTBEAT_MS);
+        if (this.config.vaultTtlDays > 0) {
+          void this.expireVaults();
+          this.expiry = setInterval(() => void this.expireVaults(), EXPIRE_EVERY_MS);
+          this.expiry.unref();
+        }
         const addr = this.http.address();
         resolve(typeof addr === 'object' && addr ? addr.port : port);
       });
@@ -158,12 +167,30 @@ export class SyncServer {
 
   async close(): Promise<void> {
     clearInterval(this.heartbeat);
+    clearInterval(this.expiry);
+    await this.expiring;
     for (const ws of this.wss.clients) ws.close(1001, 'Server wird beendet');
     await new Promise<void>((resolve) => this.wss.close(() => resolve()));
     await new Promise<void>((resolve) => this.http.close(() => resolve()));
     this.http.closeAllConnections();
     // Laufende Datenbank-Aufgaben abschließen lassen.
     await Promise.all([...this.rooms.values()].map((r) => r.run(async () => {})));
+  }
+
+  /** Entfernt Vaults, die länger als `vaultTtlDays` niemand benutzt hat. */
+  expireVaults(): Promise<void> {
+    this.expiring ??= (async () => {
+      try {
+        const before = new Date(Date.now() - this.config.vaultTtlDays * 24 * 60 * 60 * 1000);
+        const n = await this.store.expire(before);
+        if (n > 0) console.log(`${n} unbenutzte Vaults entfernt.`);
+      } catch (e) {
+        console.error('Fehler beim Entfernen unbenutzter Vaults:', e);
+      } finally {
+        this.expiring = null;
+      }
+    })();
+    return this.expiring;
   }
 
   get connectionCount(): number {
@@ -299,6 +326,7 @@ export class SyncServer {
           const first = await this.store.put(room.id, records, {
             maxRecords: this.config.maxVaultRecords,
             maxBytes: this.config.maxVaultBytes,
+            maxTotalBytes: this.config.maxTotalBytes,
           });
           if (first === null) {
             this.sendWs(conn.ws, VAULT_DELETED);
@@ -359,6 +387,7 @@ export class SyncServer {
     const r = room;
     this.runIn(conn, r, async () => {
       const head = await this.store.head(r.id);
+      await this.store.touch(r.id);
       if (head.deleted) {
         this.sendWs(conn.ws, VAULT_DELETED);
         conn.ws.close(1000);

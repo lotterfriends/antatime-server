@@ -63,6 +63,8 @@ DB_HOST=db.example.org DB_USER=antatime DB_PASSWORD=… DB_NAME=antatime \
 | `CONNECTS_PER_IP_PER_MINUTE` | `30` | neue Verbindungen pro IP und Minute |
 | `UPLOAD_BYTES_PER_IP_PER_MINUTE` | `10485760` | hochgeladene Bytes pro IP und Minute (10 MB) |
 | `MAX_VAULT_RECORDS` / `MAX_VAULT_BYTES` | `100000` / `67108864` | Speicher-Kontingent pro Sync-Code (64 MB) |
+| `MAX_TOTAL_BYTES` | `10737418240` | Speicher aller Sync-Codes zusammen (10 GB); danach nimmt der Server nur noch Änderungen an, die nichts vergrößern |
+| `VAULT_TTL_DAYS` | `365` | Sync-Codes, die so lange kein Gerät benutzt hat, werden entfernt (auch gelöschte); kehrt ein Gerät zurück, lädt es seine Daten neu hoch. `0` = nie |
 | `HELLO_TIMEOUT_MS` | `10000` | Verbindungen ohne HELLO werden danach getrennt |
 | `MAX_SEND_BUFFER_BYTES` | `4194304` | Ungelesene Sendedaten pro Verbindung (4 MB); darüber wird getrennt |
 | `SEND_STALL_TIMEOUT_MS` | `30000` | Liest ein Client beim Nachholen so lange nichts, wird getrennt |

@@ -37,6 +37,10 @@ export interface Config {
   /** Kontingent pro Vault (0 = unbegrenzt). */
   maxVaultRecords: number;
   maxVaultBytes: number;
+  /** Belegung aller Vaults zusammen in Bytes (0 = unbegrenzt). */
+  maxTotalBytes: number;
+  /** Vaults (auch gelöschte), die so viele Tage niemand benutzt hat, werden entfernt (0 = nie). */
+  vaultTtlDays: number;
   /** Ungelesene Sendedaten pro Verbindung; darüber wird die Verbindung getrennt. */
   maxSendBufferBytes: number;
   /** So lange darf ein Client beim Nachholen nichts lesen, bevor er getrennt wird. */
@@ -90,6 +94,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     helloTimeoutMs: int(env, 'HELLO_TIMEOUT_MS', 10_000),
     maxVaultRecords: int(env, 'MAX_VAULT_RECORDS', 100_000),
     maxVaultBytes: int(env, 'MAX_VAULT_BYTES', 64 * 1024 * 1024),
+    maxTotalBytes: int(env, 'MAX_TOTAL_BYTES', 10 * 1024 * 1024 * 1024),
+    vaultTtlDays: int(env, 'VAULT_TTL_DAYS', 365),
     maxSendBufferBytes: int(env, 'MAX_SEND_BUFFER_BYTES', 4 * 1024 * 1024),
     sendStallTimeoutMs: int(env, 'SEND_STALL_TIMEOUT_MS', 30_000),
   };
