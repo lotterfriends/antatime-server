@@ -26,6 +26,8 @@ import type { WebApp } from './web-app.ts';
 
 /** Datensätze pro CHANGES-Nachricht beim Nachholen. */
 const CATCH_UP_CHUNK = 500;
+/** Obergrenze einer CHANGES-Nachricht beim Nachholen (mindestens ein Datensatz). */
+const CATCH_UP_FRAME_BYTES = 1024 * 1024;
 const HEARTBEAT_MS = 30_000;
 
 /**
@@ -274,10 +276,10 @@ export class SyncServer {
 
   private fail(conn: Connection, e: unknown): void {
     if (e instanceof ProtocolError) {
-      sendWs(conn.ws, encodeError(e.code, e.message));
+      this.sendWs(conn.ws, encodeError(e.code, e.message));
     } else {
       console.error('Interner Fehler:', e);
-      sendWs(conn.ws, encodeError(ErrorCode.internal, 'Interner Fehler'));
+      this.sendWs(conn.ws, encodeError(ErrorCode.internal, 'Interner Fehler'));
     }
     conn.ws.close(1008);
   }
@@ -285,7 +287,7 @@ export class SyncServer {
   private handle(conn: Connection, msg: ClientMessage): void {
     switch (msg.op) {
       case Op.ping:
-        sendWs(conn.ws, PONG);
+        this.sendWs(conn.ws, PONG);
         return;
       case Op.hello:
         this.hello(conn, msg.version, msg.vault, msg.lastSeq);
@@ -299,15 +301,15 @@ export class SyncServer {
             maxBytes: this.config.maxVaultBytes,
           });
           if (first === null) {
-            sendWs(conn.ws, VAULT_DELETED);
+            this.sendWs(conn.ws, VAULT_DELETED);
             return;
           }
           const stored: StoredRecord[] = records.map((r, i) => ({ ...r, seq: first + i }));
           const frame = encodeChanges(stored);
           for (const other of room.conns) {
-            if (other !== conn && other.live) sendWs(other.ws, frame);
+            if (other !== conn && other.live) this.sendWs(other.ws, frame);
           }
-          sendWs(conn.ws, encodeAck(reqId, first));
+          this.sendWs(conn.ws, encodeAck(reqId, first));
         });
         return;
       }
@@ -316,11 +318,11 @@ export class SyncServer {
         this.runIn(conn, room, async () => {
           await this.store.deleteVault(room.id);
           for (const c of [...room.conns]) {
-            sendWs(c.ws, VAULT_DELETED);
+            this.sendWs(c.ws, VAULT_DELETED);
             c.ws.close(1000);
           }
           if (!room.conns.has(conn)) {
-            sendWs(conn.ws, VAULT_DELETED);
+            this.sendWs(conn.ws, VAULT_DELETED);
             conn.ws.close(1000);
           }
         });
@@ -358,7 +360,7 @@ export class SyncServer {
     this.runIn(conn, r, async () => {
       const head = await this.store.head(r.id);
       if (head.deleted) {
-        sendWs(conn.ws, VAULT_DELETED);
+        this.sendWs(conn.ws, VAULT_DELETED);
         conn.ws.close(1000);
         return;
       }
@@ -366,11 +368,53 @@ export class SyncServer {
       while (after < head.seq) {
         const chunk = await this.store.changesSince(r.id, after, CATCH_UP_CHUNK);
         if (chunk.length === 0) break;
-        sendWs(conn.ws, encodeChanges(chunk));
+        // Jede Nachricht erst senden, wenn die vorige beim Socket angekommen ist:
+        // Ein Client, der nicht liest, kann so nicht den ganzen Vault in den
+        // Arbeitsspeicher des Servers ziehen.
+        for (const frame of framesOf(chunk)) {
+          if (!(await this.sendFlushed(conn.ws, frame))) return;
+        }
         after = chunk[chunk.length - 1]!.seq;
       }
-      sendWs(conn.ws, encodeSynced(head.seq));
+      this.sendWs(conn.ws, encodeSynced(head.seq));
       conn.live = true;
+    });
+  }
+
+  /**
+   * Sendet [data], solange der Client mitliest. Stauen sich mehr als
+   * `maxSendBufferBytes` ungelesene Daten, wird die Verbindung getrennt; der
+   * Client holt nach dem Wiederverbinden per HELLO nach.
+   */
+  private sendWs(ws: WebSocket, data: Buffer): void {
+    if (ws.readyState !== ws.OPEN) return;
+    const max = this.config.maxSendBufferBytes;
+    if (max > 0 && ws.bufferedAmount > max) {
+      ws.terminate();
+      return;
+    }
+    ws.send(data, { binary: true });
+  }
+
+  /**
+   * Sendet [data] und wartet, bis die Nachricht an den Socket übergeben ist.
+   * Liest der Client länger als `sendStallTimeoutMs` nicht, wird getrennt.
+   * Liefert `false`, wenn die Verbindung dabei verloren ging.
+   */
+  private sendFlushed(ws: WebSocket, data: Buffer): Promise<boolean> {
+    if (ws.readyState !== ws.OPEN) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      let timer: NodeJS.Timeout | undefined;
+      const done = (ok: boolean) => {
+        clearTimeout(timer);
+        ws.off('close', onClose);
+        resolve(ok && ws.readyState === ws.OPEN);
+      };
+      const onClose = () => done(false);
+      ws.once('close', onClose);
+      const stall = this.config.sendStallTimeoutMs;
+      if (stall > 0) timer = setTimeout(() => ws.terminate(), stall);
+      ws.send(data, { binary: true }, (err) => done(!err));
     });
   }
 
@@ -397,6 +441,18 @@ function send(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
-function sendWs(ws: WebSocket, data: Buffer): void {
-  if (ws.readyState === ws.OPEN) ws.send(data, { binary: true });
+/** Teilt [records] in CHANGES-Nachrichten von höchstens [CATCH_UP_FRAME_BYTES]. */
+function* framesOf(records: StoredRecord[]): Generator<Buffer> {
+  let start = 0;
+  let bytes = 0;
+  for (let i = 0; i < records.length; i++) {
+    const size = records[i]!.data.length + 32;
+    if (i > start && bytes + size > CATCH_UP_FRAME_BYTES) {
+      yield encodeChanges(records.slice(start, i));
+      start = i;
+      bytes = 0;
+    }
+    bytes += size;
+  }
+  if (start < records.length) yield encodeChanges(records.slice(start));
 }

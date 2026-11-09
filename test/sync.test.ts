@@ -326,6 +326,89 @@ describe('Limits pro IP', () => {
     }
   });
 
+  /** Verbindung, die nach dem HELLO nichts mehr liest. */
+  async function deafClient(port: number, vault: Buffer): Promise<void> {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/sync`);
+    await new Promise((res, rej) => ws.once('open', res).once('error', rej));
+    ws.send(encodeHello(vault, 0));
+    (ws as unknown as { _socket: { pause(): void } })._socket.pause();
+  }
+
+  async function waitFor(cond: () => boolean, timeoutMs = 5000) {
+    const deadline = Date.now() + timeoutMs;
+    while (!cond()) {
+      if (Date.now() > deadline) throw new Error('Zeitüberschreitung');
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+
+  async function fill(port: number, vault: Buffer, records: number) {
+    const a = await Client.connect(port);
+    await a.hello(vault);
+    const data = 'x'.repeat(16 * 1024);
+    for (let i = 0; i < records; i += 200) {
+      const batch = [];
+      for (let j = i; j < Math.min(records, i + 200); j++) {
+        const k = Buffer.alloc(16);
+        k.writeUInt32BE(j);
+        batch.push({ key: k, data: Buffer.from(data) });
+      }
+      a.send(encodePush(i, batch));
+      await a.until((m) => m.op === 'ack', 10_000);
+    }
+    return a;
+  }
+
+  test('Nachholen wartet auf den Client und trennt, wenn er nicht liest', async () => {
+    const { server, port } = await start({
+      messagesPerSecond: 1000,
+      uploadBytesPerIpPerMinute: 0,
+      sendStallTimeoutMs: 300,
+    });
+    try {
+      const vault = randomBytes(16);
+      const a = await fill(port, vault, 2000); // ≈ 32 MB
+      await deafClient(port, vault);
+      await waitFor(() => server.connectionCount === 2);
+      await waitFor(() => server.connectionCount === 1);
+      // Der Vault ist danach nicht blockiert:
+      a.send(encodePush(9, [rec(1, 'neu')]));
+      await a.until((m) => m.op === 'ack');
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('langsame Empfänger von Live-Änderungen werden getrennt', async () => {
+    const { server, port } = await start({
+      messagesPerSecond: 1000,
+      uploadBytesPerIpPerMinute: 0,
+      maxSendBufferBytes: 1024 * 1024,
+    });
+    try {
+      const vault = randomBytes(16);
+      const a = await Client.connect(port);
+      await a.hello(vault);
+      await deafClient(port, vault);
+      await waitFor(() => server.connectionCount === 2);
+      await new Promise((r) => setTimeout(r, 100)); // SYNCED zugestellt → live
+      const data = 'x'.repeat(16 * 1024);
+      for (let i = 0; i < 4000 && server.connectionCount === 2; i += 200) {
+        const batch = [];
+        for (let j = i; j < i + 200; j++) {
+          const k = Buffer.alloc(16);
+          k.writeUInt32BE(j);
+          batch.push({ key: k, data: Buffer.from(data) });
+        }
+        a.send(encodePush(i, batch));
+        await a.until((m) => m.op === 'ack', 10_000);
+      }
+      await waitFor(() => server.connectionCount === 1);
+    } finally {
+      await server.close();
+    }
+  });
+
   test('ohne HELLO wird getrennt', async () => {
     const { server, port } = await start({ helloTimeoutMs: 100 });
     try {

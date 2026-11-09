@@ -64,6 +64,8 @@ DB_HOST=db.example.org DB_USER=antatime DB_PASSWORD=… DB_NAME=antatime \
 | `UPLOAD_BYTES_PER_IP_PER_MINUTE` | `10485760` | hochgeladene Bytes pro IP und Minute (10 MB) |
 | `MAX_VAULT_RECORDS` / `MAX_VAULT_BYTES` | `100000` / `67108864` | Speicher-Kontingent pro Sync-Code (64 MB) |
 | `HELLO_TIMEOUT_MS` | `10000` | Verbindungen ohne HELLO werden danach getrennt |
+| `MAX_SEND_BUFFER_BYTES` | `4194304` | Ungelesene Sendedaten pro Verbindung (4 MB); darüber wird getrennt |
+| `SEND_STALL_TIMEOUT_MS` | `30000` | Liest ein Client beim Nachholen so lange nichts, wird getrennt |
 | `CLIENT_IP_HEADER` | – | hinter einem Proxy: Header mit der Client-IP, z. B. `x-forwarded-for` (letzter Eintrag zählt) oder `cf-connecting-ip` |
 
 Limits mit dem Wert `0` sind abgeschaltet. Überschreitungen beantwortet der Server beim Verbindungsaufbau mit HTTP 429 und sonst mit `ERROR` (`4` = zu viel, `7` = Kontingent voll), danach trennt er die Verbindung. Die App verbindet sich mit Backoff neu. Ist die Client-IP nicht bekannt, warnt der Server einmal im Log, und die Limits pro IP greifen nicht.

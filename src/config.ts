@@ -37,6 +37,10 @@ export interface Config {
   /** Kontingent pro Vault (0 = unbegrenzt). */
   maxVaultRecords: number;
   maxVaultBytes: number;
+  /** Ungelesene Sendedaten pro Verbindung; darüber wird die Verbindung getrennt. */
+  maxSendBufferBytes: number;
+  /** So lange darf ein Client beim Nachholen nichts lesen, bevor er getrennt wird. */
+  sendStallTimeoutMs: number;
 }
 
 function int(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
@@ -86,5 +90,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     helloTimeoutMs: int(env, 'HELLO_TIMEOUT_MS', 10_000),
     maxVaultRecords: int(env, 'MAX_VAULT_RECORDS', 100_000),
     maxVaultBytes: int(env, 'MAX_VAULT_BYTES', 64 * 1024 * 1024),
+    maxSendBufferBytes: int(env, 'MAX_SEND_BUFFER_BYTES', 4 * 1024 * 1024),
+    sendStallTimeoutMs: int(env, 'SEND_STALL_TIMEOUT_MS', 30_000),
   };
 }
