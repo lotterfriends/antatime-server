@@ -22,6 +22,21 @@ export interface Config {
   maxConnectionsPerVault: number;
   /** Erlaubte Nachrichten pro Sekunde und Verbindung (Mittelwert, Burst = 10×). */
   messagesPerSecond: number;
+  /** Gleichzeitige Verbindungen insgesamt (0 = unbegrenzt). */
+  maxConnections: number;
+  /** Gleichzeitige Verbindungen pro Client-IP bzw. IPv6-/64 (0 = unbegrenzt). */
+  maxConnectionsPerIp: number;
+  /** Neue Verbindungen pro Client-IP und Minute (0 = unbegrenzt). */
+  connectsPerIpPerMinute: number;
+  /** Hochgeladene Bytes pro Client-IP und Minute (0 = unbegrenzt). */
+  uploadBytesPerIpPerMinute: number;
+  /** Header mit der Client-IP hinter einem Reverse-Proxy; leer = Socket-Adresse. */
+  clientIpHeader: string;
+  /** Ohne HELLO innerhalb dieser Zeit wird die Verbindung getrennt. */
+  helloTimeoutMs: number;
+  /** Kontingent pro Vault (0 = unbegrenzt). */
+  maxVaultRecords: number;
+  maxVaultBytes: number;
 }
 
 function int(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
@@ -63,5 +78,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxMessageBytes: int(env, 'MAX_MESSAGE_BYTES', 4 * 1024 * 1024),
     maxConnectionsPerVault: int(env, 'MAX_CONNECTIONS_PER_VAULT', 0),
     messagesPerSecond: int(env, 'MESSAGES_PER_SECOND', 20),
+    maxConnections: int(env, 'MAX_CONNECTIONS', 5000),
+    maxConnectionsPerIp: int(env, 'MAX_CONNECTIONS_PER_IP', 20),
+    connectsPerIpPerMinute: int(env, 'CONNECTS_PER_IP_PER_MINUTE', 30),
+    uploadBytesPerIpPerMinute: int(env, 'UPLOAD_BYTES_PER_IP_PER_MINUTE', 10 * 1024 * 1024),
+    clientIpHeader: (env['CLIENT_IP_HEADER'] ?? '').trim().toLowerCase(),
+    helloTimeoutMs: int(env, 'HELLO_TIMEOUT_MS', 10_000),
+    maxVaultRecords: int(env, 'MAX_VAULT_RECORDS', 100_000),
+    maxVaultBytes: int(env, 'MAX_VAULT_BYTES', 64 * 1024 * 1024),
   };
 }

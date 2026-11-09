@@ -5,6 +5,7 @@ import WebSocket from 'ws';
 
 import { loadConfig } from '../src/config.ts';
 import { Database } from '../src/db.ts';
+import { ipKey } from '../src/limits.ts';
 import { Op, Reader, encodeHello, encodePush } from '../src/protocol.ts';
 import { MemoryStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
@@ -72,8 +73,8 @@ class Client {
     for (const f of w) f();
   }
 
-  static async connect(port: number): Promise<Client> {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/sync`);
+  static async connect(port: number, headers: Record<string, string> = {}): Promise<Client> {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/sync`, { headers });
     await new Promise((res, rej) => ws.once('open', res).once('error', rej));
     return new Client(ws);
   }
@@ -217,10 +218,124 @@ function suite(name: string, makeStore: () => Promise<Store>) {
       const [err2] = await b.until((m) => m.op === 'error');
       assert.deepEqual(err2 && err2.op === 'error' && err2.code, 2);
     });
+
+    test('Kontingent pro Vault: Anzahl und Bytes', async () => {
+      const limited = new SyncServer(
+        { ...loadConfig({}), messagesPerSecond: 1000, maxVaultRecords: 2, maxVaultBytes: 10 },
+        store,
+      );
+      const p = await limited.listen(0, '127.0.0.1');
+      try {
+        const vault = randomBytes(16);
+        const a = await Client.connect(p);
+        await a.hello(vault);
+        a.send(encodePush(1, [rec(1, 'aaaa'), rec(2, 'bbbb')]));
+        await a.until((m) => m.op === 'ack');
+        // Überschreiben vorhandener Schlüssel geht, solange es nicht größer wird.
+        a.send(encodePush(2, [rec(1, 'cc')]));
+        await a.until((m) => m.op === 'ack');
+        a.send(encodePush(3, [rec(3, 'x')]));
+        const [err] = await a.until((m) => m.op === 'error');
+        assert.equal(err?.op === 'error' && err.code, 7);
+
+        const b = await Client.connect(p);
+        await b.hello(vault, 3);
+        b.send(encodePush(1, [rec(2, 'bbbbbbbbbb')]));
+        const [err2] = await b.until((m) => m.op === 'error');
+        assert.equal(err2?.op === 'error' && err2.code, 7);
+
+        // Verkleinern ist trotz vollem Kontingent erlaubt, danach ist wieder Platz.
+        const c = await Client.connect(p);
+        await c.hello(vault, 3);
+        c.send(encodePush(1, [rec(2, '')]));
+        await c.until((m) => m.op === 'ack');
+        c.send(encodePush(2, [rec(2, 'dddddd')]));
+        await c.until((m) => m.op === 'ack');
+      } finally {
+        await limited.close();
+      }
+    });
   });
 }
 
 suite('Sync-Server (Arbeitsspeicher)', async () => new MemoryStore());
+
+describe('Limits pro IP', () => {
+  async function start(overrides: Partial<ReturnType<typeof loadConfig>>) {
+    const server = new SyncServer({ ...loadConfig({}), ...overrides }, new MemoryStore());
+    return { server, port: await server.listen(0, '127.0.0.1') };
+  }
+
+  test('IPv6 wird auf /64 zusammengefasst', () => {
+    assert.equal(ipKey('2001:db8:1:2:3:4:5:6'), '2001:db8:1:2::/64');
+    assert.equal(ipKey('2001:db8:1:2::9'), '2001:db8:1:2::/64');
+    assert.equal(ipKey('2001:db8::1'), '2001:db8:0:0::/64');
+    assert.equal(ipKey('::ffff:192.0.2.1'), '192.0.2.1');
+    assert.equal(ipKey('192.0.2.1'), '192.0.2.1');
+  });
+
+  test('gleichzeitige Verbindungen pro IP, Freigabe beim Trennen', async () => {
+    const { server, port } = await start({ maxConnectionsPerIp: 2 });
+    try {
+      const a = await Client.connect(port);
+      await Client.connect(port);
+      await assert.rejects(Client.connect(port), /429/);
+      // Andere Adresse laut Proxy-Header ist davon nicht betroffen:
+      const { server: s2, port: p2 } = await start({ maxConnectionsPerIp: 1, clientIpHeader: 'x-forwarded-for' });
+      try {
+        await Client.connect(p2, { 'x-forwarded-for': '1.1.1.1, 203.0.113.5' });
+        await assert.rejects(Client.connect(p2, { 'x-forwarded-for': '203.0.113.5' }), /429/);
+        await Client.connect(p2, { 'x-forwarded-for': '203.0.113.6' });
+      } finally {
+        await s2.close();
+      }
+      a.close();
+      await a.until(() => false, 200).catch(() => {});
+      await Client.connect(port);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('Verbindungsaufbau pro Minute', async () => {
+    const { server, port } = await start({ connectsPerIpPerMinute: 3 });
+    try {
+      for (let i = 0; i < 3; i++) (await Client.connect(port)).close();
+      await assert.rejects(Client.connect(port), /429/);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('Upload-Bytes pro IP', async () => {
+    const { server, port } = await start({
+      messagesPerSecond: 1000,
+      maxMessageBytes: 2000,
+      uploadBytesPerIpPerMinute: 2000,
+    });
+    try {
+      const a = await Client.connect(port);
+      await a.hello(randomBytes(16));
+      a.send(encodePush(1, [rec(1, 'x'.repeat(1500))]));
+      await a.until((m) => m.op === 'ack');
+      a.send(encodePush(2, [rec(2, 'x'.repeat(1500))]));
+      const [err] = await a.until((m) => m.op === 'error');
+      assert.equal(err?.op === 'error' && err.code, 4);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('ohne HELLO wird getrennt', async () => {
+    const { server, port } = await start({ helloTimeoutMs: 100 });
+    try {
+      const a = await Client.connect(port);
+      await assert.rejects(a.until(() => false, 2000), /geschlossen/);
+    } finally {
+      await server.close();
+    }
+  });
+});
 
 // Gegen MySQL nur, wenn eine Test-Datenbank angegeben ist:
 //   TEST_DATABASE_URL=mysql://antatime:antatime@127.0.0.1:3306/antatime npm test

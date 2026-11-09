@@ -58,6 +58,15 @@ DB_HOST=db.example.org DB_USER=antatime DB_PASSWORD=… DB_NAME=antatime \
 | `MAX_MESSAGE_BYTES` | `4194304` | WebSocket-Nachricht |
 | `MAX_CONNECTIONS_PER_VAULT` | `0` | gleichzeitige Verbindungen pro Code, `0` = unbegrenzt (alle Apps mit demselben Code können gleichzeitig offen sein) |
 | `MESSAGES_PER_SECOND` | `20` | pro Verbindung (Burst 10×) |
+| `MAX_CONNECTIONS` | `5000` | gleichzeitige Verbindungen insgesamt |
+| `MAX_CONNECTIONS_PER_IP` | `20` | gleichzeitig pro IP (IPv6: pro /64-Netz) |
+| `CONNECTS_PER_IP_PER_MINUTE` | `30` | neue Verbindungen pro IP und Minute |
+| `UPLOAD_BYTES_PER_IP_PER_MINUTE` | `10485760` | hochgeladene Bytes pro IP und Minute (10 MB) |
+| `MAX_VAULT_RECORDS` / `MAX_VAULT_BYTES` | `100000` / `67108864` | Speicher-Kontingent pro Sync-Code (64 MB) |
+| `HELLO_TIMEOUT_MS` | `10000` | Verbindungen ohne HELLO werden danach getrennt |
+| `CLIENT_IP_HEADER` | – | hinter einem Proxy: Header mit der Client-IP, z. B. `x-forwarded-for` (letzter Eintrag zählt) oder `cf-connecting-ip` |
+
+Limits mit dem Wert `0` sind abgeschaltet. Überschreitungen beantwortet der Server beim Verbindungsaufbau mit HTTP 429 und sonst mit `ERROR` (`4` = zu viel, `7` = Kontingent voll), danach trennt er die Verbindung. Die App verbindet sich mit Backoff neu. Ist die Client-IP nicht bekannt, warnt der Server einmal im Log, und die Limits pro IP greifen nicht.
 
 **TLS:** Der Server spricht selbst nur HTTP/`ws://`. Öffentlich gehört ein Reverse-Proxy mit TLS davor (Caddy, nginx, Traefik), der WebSocket-Upgrades auf `/sync` durchreicht. Die Inhalte sind zwar ohnehin verschlüsselt, TLS schützt aber die Metadaten (Vault-ID, Zeitpunkte, Größen). Eine per HTTPS ausgelieferte Web-App kann außerdem nur `wss://` verwenden.
 

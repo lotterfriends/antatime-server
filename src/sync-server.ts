@@ -5,6 +5,7 @@ import { WebSocketServer } from 'ws';
 import type { RawData, WebSocket } from 'ws';
 
 import type { Config } from './config.ts';
+import { IpLimiter, clientIp } from './limits.ts';
 import {
   ErrorCode,
   Op,
@@ -69,6 +70,9 @@ interface Connection {
   alive: boolean;
   tokens: number;
   refilledAt: number;
+  /** Client-IP (IPv6: /64), `undefined` wenn unbekannt → keine IP-Limits. */
+  ip: string | undefined;
+  helloTimer: NodeJS.Timeout | undefined;
 }
 
 export class SyncServer {
@@ -80,11 +84,14 @@ export class SyncServer {
   private readonly store: Store;
 
   private readonly web: WebApp | null;
+  private readonly ipLimits: IpLimiter;
+  private warnedUnknownIp = false;
 
   constructor(config: Config, store: Store, web: WebApp | null = null) {
     this.config = config;
     this.store = store;
     this.web = web;
+    this.ipLimits = new IpLimiter(config);
     this.http = createServer((req, res) => void this.handleHttp(req, res));
     this.wss = new WebSocketServer({
       noServer: true,
@@ -97,7 +104,37 @@ export class SyncServer {
         socket.end('HTTP/1.1 404 Not Found\r\n\r\n');
         return;
       }
-      this.wss.handleUpgrade(req, socket, head, (ws) => this.accept(ws));
+      const max = this.config.maxConnections;
+      if (max > 0 && this.wss.clients.size >= max) {
+        socket.end('HTTP/1.1 503 Service Unavailable\r\nRetry-After: 30\r\n\r\n');
+        return;
+      }
+      const ip = clientIp(req, this.config.clientIpHeader);
+      if (ip === undefined) {
+        if (!this.warnedUnknownIp) {
+          this.warnedUnknownIp = true;
+          console.warn('Client-IP unbekannt: Limits pro IP greifen nicht (CLIENT_IP_HEADER setzen).');
+        }
+      } else {
+        if (!this.warnedUnknownIp && !this.config.clientIpHeader && (ip === '127.0.0.1' || ip === '0:0:0:0::/64')) {
+          this.warnedUnknownIp = true;
+          console.warn('Verbindung von localhost: Läuft der Server hinter einem Proxy, CLIENT_IP_HEADER setzen, sonst teilen sich alle Nutzer ein IP-Limit.');
+        }
+        const refused = this.ipLimits.connect(ip);
+        if (refused) {
+          socket.end('HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\n\r\n');
+          return;
+        }
+      }
+      // Ab hier ist die Verbindung pro IP gezählt und muss wieder freigegeben werden.
+      let accepted = false;
+      socket.once('close', () => {
+        if (!accepted && ip !== undefined) this.ipLimits.disconnect(ip);
+      });
+      this.wss.handleUpgrade(req, socket, head, (ws) => {
+        accepted = true;
+        this.accept(ws, ip);
+      });
     });
   }
 
@@ -107,7 +144,10 @@ export class SyncServer {
       this.http.once('error', reject);
       this.http.listen(port, host, () => {
         this.http.off('error', reject);
-        this.heartbeat = setInterval(() => this.checkAlive(), HEARTBEAT_MS);
+        this.heartbeat = setInterval(() => {
+          this.checkAlive();
+          this.ipLimits.sweep();
+        }, HEARTBEAT_MS);
         const addr = this.http.address();
         resolve(typeof addr === 'object' && addr ? addr.port : port);
       });
@@ -162,7 +202,7 @@ export class SyncServer {
     }
   }
 
-  private accept(ws: WebSocket): void {
+  private accept(ws: WebSocket, ip: string | undefined): void {
     const conn: Connection = {
       ws,
       room: null,
@@ -170,11 +210,23 @@ export class SyncServer {
       alive: true,
       tokens: this.config.messagesPerSecond * 10,
       refilledAt: Date.now(),
+      ip,
+      helloTimer: undefined,
     };
+    if (this.config.helloTimeoutMs > 0) {
+      conn.helloTimer = setTimeout(() => {
+        if (!conn.room) ws.close(1008, 'HELLO fehlt');
+      }, this.config.helloTimeoutMs);
+      conn.helloTimer.unref();
+    }
     connOf.set(ws, conn);
     ws.on('pong', () => (conn.alive = true));
     ws.on('message', (data, isBinary) => this.onMessage(conn, data, isBinary));
-    ws.on('close', () => this.detach(conn));
+    ws.on('close', () => {
+      clearTimeout(conn.helloTimer);
+      if (ip !== undefined) this.ipLimits.disconnect(ip);
+      this.detach(conn);
+    });
     ws.on('error', () => ws.terminate());
   }
 
@@ -200,6 +252,9 @@ export class SyncServer {
         throw new ProtocolError(ErrorCode.rateLimited, 'Zu viele Nachrichten');
       }
       const buf = Array.isArray(data) ? Buffer.concat(data) : Buffer.from(data as ArrayBuffer);
+      if (conn.ip !== undefined && !this.ipLimits.upload(conn.ip, buf.length)) {
+        throw new ProtocolError(ErrorCode.rateLimited, 'Zu viele Daten von dieser Adresse, bitte später erneut');
+      }
       const msg = decodeClientMessage(buf, this.config);
       this.handle(conn, msg);
     } catch (e) {
@@ -239,7 +294,10 @@ export class SyncServer {
         const room = this.requireRoom(conn);
         const { reqId, records } = msg;
         this.runIn(conn, room, async () => {
-          const first = await this.store.put(room.id, records);
+          const first = await this.store.put(room.id, records, {
+            maxRecords: this.config.maxVaultRecords,
+            maxBytes: this.config.maxVaultBytes,
+          });
           if (first === null) {
             sendWs(conn.ws, VAULT_DELETED);
             return;
@@ -295,6 +353,7 @@ export class SyncServer {
     }
     conn.room = room;
     room.conns.add(conn);
+    clearTimeout(conn.helloTimer);
     const r = room;
     this.runIn(conn, r, async () => {
       const head = await this.store.head(r.id);

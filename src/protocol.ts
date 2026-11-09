@@ -46,6 +46,7 @@ export const ErrorCode = {
   rateLimited: 4,
   tooManyConnections: 5,
   internal: 6,
+  quotaExceeded: 7,
 } as const;
 
 export class ProtocolError extends Error {
