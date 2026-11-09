@@ -9,6 +9,10 @@ on:
       app_ref:
         description: Branch, Tag oder Commit der App (lotterfriends/antatime)
         default: main
+      deploy:
+        description: Nach dem Build per FTP auf den Server hochladen (nur Admins, nur master)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -115,3 +119,79 @@ jobs:
           name: antatime-server
           path: antatime-server/dist/antatime-server.cjs
           if-no-files-found: error
+
+  # Manuell: „Run workflow“ auf master mit Haken „deploy“. Zugangsdaten im
+  # Environment „production“ (Settings → Environments):
+  #   Variablen: FTP_HOST, FTP_USER, FTP_REMOTE_DIR (Anwendungsverzeichnis in
+  #              Plesk), optional FTP_PORT, FTP_VERIFY_CERT=false (selbst
+  #              signiertes Zertifikat), FTP_INSECURE=true (FTP ohne TLS)
+  #   Secret:    FTP_PASSWORD
+  deploy:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - name: Nur Admins des Repos
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.triggering_actor }}
+        run: |
+          perm=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$ACTOR/permission" --jq .permission)
+          if [ "$perm" != "admin" ]; then
+            echo "::error::$ACTOR hat die Berechtigung „$perm“, Deploy ist nur für Admins erlaubt."
+            exit 1
+          fi
+          echo "Deploy durch $ACTOR (admin)"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: antatime-server
+          path: dist
+
+      - name: lftp installieren
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq lftp
+
+      - name: Per FTP hochladen und App neu starten
+        env:
+          FTP_HOST: ${{ vars.FTP_HOST }}
+          FTP_PORT: ${{ vars.FTP_PORT }}
+          FTP_USER: ${{ vars.FTP_USER }}
+          FTP_REMOTE_DIR: ${{ vars.FTP_REMOTE_DIR }}
+          FTP_VERIFY_CERT: ${{ vars.FTP_VERIFY_CERT }}
+          FTP_INSECURE: ${{ vars.FTP_INSECURE }}
+          LFTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+        run: |
+          for v in FTP_HOST FTP_USER FTP_REMOTE_DIR LFTP_PASSWORD; do
+            if [ -z "${!v}" ]; then
+              echo "::error::$v fehlt (Environment „production“, Passwort als Secret FTP_PASSWORD)."
+              exit 1
+            fi
+          done
+          if [ "$FTP_INSECURE" = "true" ]; then
+            echo "::warning::FTP ohne TLS, das Passwort geht im Klartext über die Leitung."
+            tls="set ftp:ssl-allow false"
+          else
+            tls="set ftp:ssl-force true; set ftp:ssl-protect-data true"
+          fi
+          verify=$([ "$FTP_VERIFY_CERT" = "false" ] && echo false || echo true)
+          : > restart.txt
+          # Erst unter temporärem Namen hochladen, dann umbenennen: Passenger
+          # sieht nie eine halbe Datei. tmp/restart.txt startet die App neu.
+          lftp -p "${FTP_PORT:-21}" -u "$FTP_USER" --env-password "$FTP_HOST" <<LFTP
+          set cmd:fail-exit true
+          set net:timeout 30
+          set net:max-retries 2
+          set ssl:verify-certificate $verify
+          $tls
+          cd "$FTP_REMOTE_DIR"
+          put dist/antatime-server.cjs -o antatime-server.cjs.uploading
+          mv antatime-server.cjs.uploading antatime-server.cjs
+          mkdir -f -p tmp
+          put restart.txt -o tmp/restart.txt
+          cls -l antatime-server.cjs
+          bye
+          LFTP
