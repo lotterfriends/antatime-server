@@ -9,7 +9,7 @@ import { ipKey } from '../src/limits.ts';
 import { Op, Reader, encodeHello, encodePush } from '../src/protocol.ts';
 import { MemoryStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
-import { SyncServer } from '../src/sync-server.ts';
+import { DropStats, SyncServer } from '../src/sync-server.ts';
 
 type ServerMsg =
   | { op: 'changes'; records: { seq: number; key: string; data: string }[] }
@@ -260,6 +260,20 @@ function suite(name: string, makeStore: () => Promise<Store>) {
 
 suite('Sync-Server (Arbeitsspeicher)', async () => new MemoryStore());
 
+test('Trennungsgründe werden gesammelt geloggt', () => {
+  const stats = new DropStats();
+  const lines: string[] = [];
+  const log = (l: string) => void lines.push(l);
+  stats.flush(log);
+  assert.deepEqual(lines, []);
+  stats.add('heartbeatTimeout');
+  stats.add('heartbeatTimeout');
+  stats.add('error:quotaExceeded');
+  stats.flush(log);
+  stats.flush(log);
+  assert.deepEqual(lines, ['Verbindungen abgelehnt/getrennt: heartbeatTimeout=2, error:quotaExceeded=1']);
+});
+
 describe('Limits pro IP', () => {
   async function start(overrides: Partial<ReturnType<typeof loadConfig>>) {
     const server = new SyncServer({ ...loadConfig({}), ...overrides }, new MemoryStore());
@@ -302,6 +316,7 @@ describe('Limits pro IP', () => {
     try {
       for (let i = 0; i < 3; i++) (await Client.connect(port)).close();
       await assert.rejects(Client.connect(port), /429/);
+      assert.deepEqual(server.drops.take(), { 'ipLimit(127.0.0.1)': 1 });
     } finally {
       await server.close();
     }
@@ -464,6 +479,7 @@ describe('Limits pro IP', () => {
     try {
       const a = await Client.connect(port);
       await assert.rejects(a.until(() => false, 2000), /geschlossen/);
+      assert.deepEqual(server.drops.take(), { helloTimeout: 1 });
     } finally {
       await server.close();
     }

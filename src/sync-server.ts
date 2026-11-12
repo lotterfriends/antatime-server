@@ -33,6 +33,34 @@ const HEARTBEAT_MS = 30_000;
 const EXPIRE_EVERY_MS = 60 * 60 * 1000;
 
 /**
+ * Zählt, warum Verbindungen abgelehnt oder getrennt wurden, und schreibt die
+ * Summe gesammelt ins Log (höchstens eine Zeile pro Heartbeat-Intervall).
+ */
+export class DropStats {
+  private readonly counts = new Map<string, number>();
+
+  add(reason: string): void {
+    this.counts.set(reason, (this.counts.get(reason) ?? 0) + 1);
+  }
+
+  /** Liefert die Zählerstände seit dem letzten Aufruf und setzt sie zurück. */
+  take(): Record<string, number> {
+    const out = Object.fromEntries(this.counts);
+    this.counts.clear();
+    return out;
+  }
+
+  flush(log: (line: string) => void = console.log): void {
+    const parts = Object.entries(this.take()).map(([k, v]) => `${k}=${v}`);
+    if (parts.length > 0) log(`Verbindungen abgelehnt/getrennt: ${parts.join(', ')}`);
+  }
+}
+
+const ERROR_NAMES: Record<number, string> = Object.fromEntries(
+  Object.entries(ErrorCode).map(([k, v]) => [v, k]),
+);
+
+/**
  * Die Vault-ID wird nur gehasht gespeichert: Wer die Datenbank liest, kann
  * damit nicht einmal Daten in einen Vault schreiben.
  */
@@ -92,6 +120,7 @@ export class SyncServer {
   private readonly web: WebApp | null;
   private readonly ipLimits: IpLimiter;
   private warnedUnknownIp = false;
+  readonly drops = new DropStats();
 
   constructor(config: Config, store: Store, web: WebApp | null = null) {
     this.config = config;
@@ -107,11 +136,13 @@ export class SyncServer {
     });
     this.http.on('upgrade', (req, socket, head) => {
       if (pathOf(req) !== '/sync') {
+        this.drops.add('notFound');
         socket.end('HTTP/1.1 404 Not Found\r\n\r\n');
         return;
       }
       const max = this.config.maxConnections;
       if (max > 0 && this.wss.clients.size >= max) {
+        this.drops.add('serverFull');
         socket.end('HTTP/1.1 503 Service Unavailable\r\nRetry-After: 30\r\n\r\n');
         return;
       }
@@ -128,6 +159,7 @@ export class SyncServer {
         }
         const refused = this.ipLimits.connect(ip);
         if (refused) {
+          this.drops.add(`ipLimit(${ip})`);
           socket.end('HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\n\r\n');
           return;
         }
@@ -153,6 +185,7 @@ export class SyncServer {
         this.heartbeat = setInterval(() => {
           this.checkAlive();
           this.ipLimits.sweep();
+          this.drops.flush();
         }, HEARTBEAT_MS);
         if (this.config.vaultTtlDays > 0) {
           void this.expireVaults();
@@ -168,6 +201,7 @@ export class SyncServer {
   async close(): Promise<void> {
     clearInterval(this.heartbeat);
     clearInterval(this.expiry);
+    this.drops.flush();
     await this.expiring;
     for (const ws of this.wss.clients) ws.close(1001, 'Server wird beendet');
     await new Promise<void>((resolve) => this.wss.close(() => resolve()));
@@ -223,6 +257,7 @@ export class SyncServer {
       const conn = connOf.get(ws);
       if (!conn) continue;
       if (!conn.alive) {
+        this.drops.add('heartbeatTimeout');
         ws.terminate();
         continue;
       }
@@ -244,7 +279,10 @@ export class SyncServer {
     };
     if (this.config.helloTimeoutMs > 0) {
       conn.helloTimer = setTimeout(() => {
-        if (!conn.room) ws.close(1008, 'HELLO fehlt');
+        if (!conn.room) {
+          this.drops.add('helloTimeout');
+          ws.close(1008, 'HELLO fehlt');
+        }
       }, this.config.helloTimeoutMs);
       conn.helloTimer.unref();
     }
@@ -256,7 +294,10 @@ export class SyncServer {
       if (ip !== undefined) this.ipLimits.disconnect(ip);
       this.detach(conn);
     });
-    ws.on('error', () => ws.terminate());
+    ws.on('error', () => {
+      this.drops.add('socketError');
+      ws.terminate();
+    });
   }
 
   private detach(conn: Connection): void {
@@ -303,8 +344,10 @@ export class SyncServer {
 
   private fail(conn: Connection, e: unknown): void {
     if (e instanceof ProtocolError) {
+      this.drops.add(`error:${ERROR_NAMES[e.code] ?? e.code}`);
       this.sendWs(conn.ws, encodeError(e.code, e.message));
     } else {
+      this.drops.add('error:internal');
       console.error('Interner Fehler:', e);
       this.sendWs(conn.ws, encodeError(ErrorCode.internal, 'Interner Fehler'));
     }
@@ -419,6 +462,7 @@ export class SyncServer {
     if (ws.readyState !== ws.OPEN) return;
     const max = this.config.maxSendBufferBytes;
     if (max > 0 && ws.bufferedAmount > max) {
+      this.drops.add('sendBufferFull');
       ws.terminate();
       return;
     }
@@ -442,7 +486,12 @@ export class SyncServer {
       const onClose = () => done(false);
       ws.once('close', onClose);
       const stall = this.config.sendStallTimeoutMs;
-      if (stall > 0) timer = setTimeout(() => ws.terminate(), stall);
+      if (stall > 0) {
+        timer = setTimeout(() => {
+          this.drops.add('sendStalled');
+          ws.terminate();
+        }, stall);
+      }
       ws.send(data, { binary: true }, (err) => done(!err));
     });
   }
