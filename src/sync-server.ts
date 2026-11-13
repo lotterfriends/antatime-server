@@ -150,12 +150,18 @@ export class SyncServer {
       if (ip === undefined) {
         if (!this.warnedUnknownIp) {
           this.warnedUnknownIp = true;
-          console.warn('Client-IP unbekannt: Limits pro IP greifen nicht (CLIENT_IP_HEADER setzen).');
+          console.warn(
+            'Client-IP unbekannt: Limits pro IP greifen nicht (CLIENT_IP_HEADER setzen).',
+            describeIpSources(req, this.config.clientIpHeader),
+          );
         }
       } else {
         if (!this.warnedUnknownIp && !this.config.clientIpHeader && (ip === '127.0.0.1' || ip === '0:0:0:0::/64')) {
           this.warnedUnknownIp = true;
-          console.warn('Verbindung von localhost: Läuft der Server hinter einem Proxy, CLIENT_IP_HEADER setzen, sonst teilen sich alle Nutzer ein IP-Limit.');
+          console.warn(
+            'Verbindung von localhost: Läuft der Server hinter einem Proxy, CLIENT_IP_HEADER setzen, sonst teilen sich alle Nutzer ein IP-Limit.',
+            describeIpSources(req, this.config.clientIpHeader),
+          );
         }
         const refused = this.ipLimits.connect(ip);
         if (refused) {
@@ -509,6 +515,28 @@ export class SyncServer {
 }
 
 const connOf = new WeakMap<WebSocket, Connection>();
+
+/**
+ * Was der Server über die Herkunft einer Anfrage weiß – für die Warnung,
+ * wenn die Client-IP fehlt: Socket-Adresse, eingestellter Header und alle
+ * Header, die typischerweise die Client-IP tragen, sowie die Namen aller
+ * übrigen Header (ohne Werte).
+ */
+export function describeIpSources(req: IncomingMessage, header: string): string {
+  const ipHeader = /forwarded|real-ip|client-ip|connecting-ip|client-addr/i;
+  const ipHeaders: string[] = [];
+  const others: string[] = [];
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (ipHeader.test(name)) ipHeaders.push(`${name}=${String(value)}`);
+    else others.push(name);
+  }
+  return [
+    `Socket: ${req.socket.remoteAddress ?? '–'}`,
+    `CLIENT_IP_HEADER: ${header || '–'}`,
+    `IP-Header: ${ipHeaders.join(', ') || '–'}`,
+    `weitere Header: ${others.join(', ') || '–'}`,
+  ].join('; ');
+}
 
 function pathOf(req: IncomingMessage): string {
   return new URL(req.url ?? '/', 'http://x').pathname;

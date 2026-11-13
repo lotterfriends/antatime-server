@@ -9,7 +9,7 @@ import { ipKey } from '../src/limits.ts';
 import { Op, Reader, encodeHello, encodePush } from '../src/protocol.ts';
 import { MemoryStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
-import { DropStats, SyncServer } from '../src/sync-server.ts';
+import { DropStats, SyncServer, describeIpSources } from '../src/sync-server.ts';
 
 type ServerMsg =
   | { op: 'changes'; records: { seq: number; key: string; data: string }[] }
@@ -272,6 +272,17 @@ test('Trennungsgründe werden gesammelt geloggt', () => {
   stats.flush(log);
   stats.flush(log);
   assert.deepEqual(lines, ['Verbindungen abgelehnt/getrennt: heartbeatTimeout=2, error:quotaExceeded=1']);
+});
+
+test('Warnung ohne Client-IP nennt die vorhandenen Header', () => {
+  const req = {
+    headers: { host: 'antatime.de', 'x-forwarded-for': '203.0.113.5', upgrade: 'websocket' },
+    socket: { remoteAddress: undefined },
+  } as unknown as Parameters<typeof describeIpSources>[0];
+  assert.equal(
+    describeIpSources(req, 'x-real-ip'),
+    'Socket: –; CLIENT_IP_HEADER: x-real-ip; IP-Header: x-forwarded-for=203.0.113.5; weitere Header: host, upgrade',
+  );
 });
 
 describe('Limits pro IP', () => {
