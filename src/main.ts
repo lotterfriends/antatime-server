@@ -1,11 +1,20 @@
 import { loadConfig } from './config.ts';
 import { Database } from './db.ts';
+import { installFileLog } from './log.ts';
 import { MemoryStore } from './store.ts';
 import type { Store } from './store.ts';
 import { SyncServer } from './sync-server.ts';
 import { DirectoryWebApp, EmbeddedWebApp } from './web-app.ts';
 import type { WebApp } from './web-app.ts';
 import embeddedWeb from './web-embedded.ts';
+
+// Zuerst, damit auch Fehler in der Konfiguration in der Datei landen.
+const logFile = process.env['LOG_FILE']?.trim();
+if (logFile) {
+  const raw = process.env['LOG_FILE_MAX_BYTES']?.trim();
+  const max = raw ? Number(raw) : NaN;
+  installFileLog(logFile, Number.isInteger(max) && max >= 0 ? max : undefined);
+}
 
 async function main(): Promise<void> {
   const config = loadConfig();
