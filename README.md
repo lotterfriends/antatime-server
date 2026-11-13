@@ -78,6 +78,13 @@ Limits mit dem Wert `0` sind abgeschaltet. Überschreitungen beantwortet der Ser
 
 Der Server ist für **eine Instanz** ausgelegt: Die Reihenfolge-Garantie (siehe unten) beruht auf einer Warteschlange pro Vault im Prozess. Mehrere Instanzen bräuchten Sticky-Routing pro Vault oder Pub/Sub.
 
+**Plesk (Node.js über Passenger):** Die Konsolenausgabe der App ist dort nicht einsehbar, und die Socket-Adresse ist leer, weil Passenger über einen Unix-Socket weiterleitet. Unter Node.js → Umgebung setzen:
+
+- `LOG_FILE=../sync-logs/sync.log` – relativ zum Anwendungsstamm (`httpdocs`), daher unabhängig vom Abo-Verzeichnis; den Ordner `sync-logs` vorher neben `httpdocs` anlegen (nicht in `httpdocs`, sonst ist die Datei womöglich öffentlich abrufbar)
+- `CLIENT_IP_HEADER=!~passenger-client-address` – Passenger setzt diesen internen Header selbst aus der Adresse, die nginx sieht; Clients können ihn nicht vorgeben. Eigene nginx-Anweisungen sind dafür nicht nötig.
+
+Danach die App neu starten. Fehlt die Client-IP, nennt die Warnung im Log die empfangenen Header. Passenger startet die App gelegentlich neu (beim Neuladen von nginx durch Plesk); die Apps verbinden sich dann nach wenigen Sekunden von selbst wieder.
+
 ## Web-App
 
 Der Server liefert den Flutter-Web-Build der App unter `/` aus, `/sync` (WebSocket) und `/health` bleiben unverändert.
