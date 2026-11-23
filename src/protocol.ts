@@ -12,7 +12,10 @@
  *
  * Server → Client
  *   0x81 CHANGES       varint n, n × { varint seq, key, varint len, data }
- *   0x82 SYNCED        varint headSeq                (Nachholen abgeschlossen)
+ *   0x82 SYNCED        varint headSeq, [varint serverTime]  (Nachholen abgeschlossen;
+ *                      serverTime = Uhrzeit des Servers in ms seit 1970, damit
+ *                      Clients eine falsch gehende Geräteuhr erkennen. Ältere
+ *                      Clients ignorieren das Feld.)
  *   0x83 ACK           varint reqId, varint firstSeq (Seqs firstSeq … firstSeq+n−1)
  *   0x84 PONG
  *   0x85 VAULT_DELETED
@@ -226,8 +229,8 @@ export function encodeChanges(records: StoredRecord[]): Buffer {
   return w.finish();
 }
 
-export function encodeSynced(headSeq: number): Buffer {
-  return new Writer().u8(Op.synced).varint(headSeq).finish();
+export function encodeSynced(headSeq: number, serverTime = Date.now()): Buffer {
+  return new Writer().u8(Op.synced).varint(headSeq).varint(serverTime).finish();
 }
 
 export function encodeAck(reqId: number, firstSeq: number): Buffer {

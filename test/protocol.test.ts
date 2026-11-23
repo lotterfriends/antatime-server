@@ -9,6 +9,7 @@ import {
   decodeClientMessage,
   encodeHello,
   encodePush,
+  encodeSynced,
 } from '../src/protocol.ts';
 
 const limits = { maxRecordBytes: 1024, maxRecordsPerPush: 10 };
@@ -54,4 +55,17 @@ test('Ungültige Nachrichten werden abgelehnt', () => {
   for (const c of cases) {
     assert.throws(() => decodeClientMessage(c, limits), ProtocolError);
   }
+});
+
+test('SYNCED enthält die Uhrzeit des Servers', () => {
+  const r = new Reader(encodeSynced(3, 1_790_000_000_000));
+  assert.equal(r.u8(), Op.synced);
+  assert.equal(r.varint(), 3);
+  assert.equal(r.varint(), 1_790_000_000_000);
+  assert.ok(r.done);
+
+  const now = new Reader(encodeSynced(0));
+  now.u8();
+  now.varint();
+  assert.ok(Math.abs(now.varint() - Date.now()) < 1000);
 });
