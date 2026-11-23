@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
+import type { Duplex } from 'node:stream';
 import { WebSocketServer } from 'ws';
 import type { RawData, WebSocket } from 'ws';
 
 import type { Config } from './config.ts';
-import { IpLimiter, clientIp } from './limits.ts';
+import { IpLimiter, TrustedProxies, clientIp } from './limits.ts';
 import {
   ErrorCode,
   Op,
@@ -31,6 +32,17 @@ const CATCH_UP_FRAME_BYTES = 1024 * 1024;
 const HEARTBEAT_MS = 30_000;
 /** Wie oft abgelaufene Vaults entfernt werden. */
 const EXPIRE_EVERY_MS = 60 * 60 * 1000;
+/** So lange gilt ein `/health`-Ergebnis, damit Abfragen die Datenbank nicht fluten. */
+const HEALTH_CACHE_MS = 2000;
+/** Abgelehnte Upgrade-Sockets werden spätestens danach geschlossen. */
+const REJECT_CLOSE_MS = 1000;
+/**
+ * Nachholen außerhalb der Warteschlange: Fehlen danach noch mehr Datensätze als
+ * das, läuft eine weitere Runde außerhalb, bevor der Rest in der Warteschlange
+ * nachgeschickt wird (höchstens [CATCH_UP_ROUNDS] Runden).
+ */
+const CATCH_UP_TAIL = CATCH_UP_CHUNK;
+const CATCH_UP_ROUNDS = 3;
 
 /**
  * Zählt, warum Verbindungen abgelehnt oder getrennt wurden, und schreibt die
@@ -119,7 +131,12 @@ export class SyncServer {
 
   private readonly web: WebApp | null;
   private readonly ipLimits: IpLimiter;
+  private readonly trustedProxies: TrustedProxies;
+  private health: { at: number; ok: Promise<boolean> } | null = null;
+  /** Laufendes Nachholen außerhalb der Warteschlangen; `close()` wartet darauf. */
+  private readonly catchUps = new Set<Promise<void>>();
   private warnedUnknownIp = false;
+  private warnedUntrusted = false;
   readonly drops = new DropStats();
 
   constructor(config: Config, store: Store, web: WebApp | null = null) {
@@ -127,6 +144,7 @@ export class SyncServer {
     this.store = store;
     this.web = web;
     this.ipLimits = new IpLimiter(config);
+    this.trustedProxies = new TrustedProxies(config.trustedProxies);
     this.http = createServer((req, res) => void this.handleHttp(req, res));
     this.wss = new WebSocketServer({
       noServer: true,
@@ -135,18 +153,28 @@ export class SyncServer {
       perMessageDeflate: false,
     });
     this.http.on('upgrade', (req, socket, head) => {
+      // Node entfernt vor 'upgrade' seinen eigenen Fehler-Listener: Ohne diesen
+      // würde z. B. ein ECONNRESET beim Ablehnen den ganzen Prozess beenden.
+      socket.on('error', () => socket.destroy());
       if (pathOf(req) !== '/sync') {
         this.drops.add('notFound');
-        socket.end('HTTP/1.1 404 Not Found\r\n\r\n');
+        reject(socket, 'HTTP/1.1 404 Not Found\r\n\r\n');
         return;
       }
       const max = this.config.maxConnections;
       if (max > 0 && this.wss.clients.size >= max) {
         this.drops.add('serverFull');
-        socket.end('HTTP/1.1 503 Service Unavailable\r\nRetry-After: 30\r\n\r\n');
+        reject(socket, 'HTTP/1.1 503 Service Unavailable\r\nRetry-After: 30\r\n\r\n');
         return;
       }
-      const ip = clientIp(req, this.config.clientIpHeader);
+      const ip = clientIp(req, this.config.clientIpHeader, this.trustedProxies);
+      const from = req.socket.remoteAddress;
+      if (!this.warnedUntrusted && this.config.clientIpHeader && from && !this.trustedProxies.has(from)) {
+        this.warnedUntrusted = true;
+        console.warn(
+          `CLIENT_IP_HEADER ignoriert: Verbindung von ${from} steht nicht in TRUSTED_PROXIES (Proxy eintragen, falls er dort fehlt).`,
+        );
+      }
       if (ip === undefined) {
         if (!this.warnedUnknownIp) {
           this.warnedUnknownIp = true;
@@ -166,7 +194,7 @@ export class SyncServer {
         const refused = this.ipLimits.connect(ip);
         if (refused) {
           this.drops.add(`ipLimit(${ip})`);
-          socket.end('HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\n\r\n');
+          reject(socket, 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\n\r\n');
           return;
         }
       }
@@ -214,6 +242,7 @@ export class SyncServer {
     await new Promise<void>((resolve) => this.http.close(() => resolve()));
     this.http.closeAllConnections();
     // Laufende Datenbank-Aufgaben abschließen lassen.
+    await Promise.all(this.catchUps);
     await Promise.all([...this.rooms.values()].map((r) => r.run(async () => {})));
   }
 
@@ -239,12 +268,8 @@ export class SyncServer {
 
   private async handleHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method === 'GET' && pathOf(req) === '/health') {
-      try {
-        await this.store.ping();
-        send(res, 200, { status: 'ok', connections: this.connectionCount });
-      } catch {
-        send(res, 503, { status: 'database unavailable' });
-      }
+      if (await this.checkHealth()) send(res, 200, { status: 'ok', connections: this.connectionCount });
+      else send(res, 503, { status: 'database unavailable' });
       return;
     }
     try {
@@ -256,6 +281,24 @@ export class SyncServer {
       return;
     }
     send(res, 404, { status: 'not found' });
+  }
+
+  /**
+   * Datenbank erreichbar? Das Ergebnis gilt [HEALTH_CACHE_MS] lang, gleichzeitige
+   * Anfragen teilen sich eine Abfrage – `/health` ist ohne Limit öffentlich.
+   */
+  private checkHealth(): Promise<boolean> {
+    const now = Date.now();
+    if (!this.health || now - this.health.at >= HEALTH_CACHE_MS) {
+      this.health = {
+        at: now,
+        ok: this.store.ping().then(
+          () => true,
+          () => false,
+        ),
+      };
+    }
+    return this.health.ok;
   }
 
   private checkAlive(): void {
@@ -434,6 +477,9 @@ export class SyncServer {
     room.conns.add(conn);
     clearTimeout(conn.helloTimer);
     const r = room;
+    // Nur den Stand lesen geht in die Warteschlange. Das eigentliche Nachholen
+    // läuft außerhalb, sonst hielte ein langsamer Client PUSH/ACK aller
+    // anderen Geräte des Vaults auf.
     this.runIn(conn, r, async () => {
       const head = await this.store.head(r.id);
       await this.store.touch(r.id);
@@ -442,21 +488,69 @@ export class SyncServer {
         conn.ws.close(1000);
         return;
       }
-      let after = lastSeq;
-      while (after < head.seq) {
-        const chunk = await this.store.changesSince(r.id, after, CATCH_UP_CHUNK);
-        if (chunk.length === 0) break;
-        // Jede Nachricht erst senden, wenn die vorige beim Socket angekommen ist:
-        // Ein Client, der nicht liest, kann so nicht den ganzen Vault in den
-        // Arbeitsspeicher des Servers ziehen.
-        for (const frame of framesOf(chunk)) {
-          if (!(await this.sendFlushed(conn.ws, frame))) return;
-        }
-        after = chunk[chunk.length - 1]!.seq;
-      }
-      this.sendWs(conn.ws, encodeSynced(head.seq));
-      conn.live = true;
+      this.track(this.catchUp(conn, r, lastSeq, head.seq));
     });
+  }
+
+  private track(task: Promise<void>): void {
+    this.catchUps.add(task);
+    void task.finally(() => this.catchUps.delete(task));
+  }
+
+  /**
+   * Holt bis [target] außerhalb der Warteschlange nach (ggf. in mehreren
+   * Runden, falls währenddessen viel dazukam). Den Rest schickt ein letzter
+   * Schritt in der Warteschlange, der auch SYNCED sendet und die Verbindung
+   * live schaltet: Dazwischen kann kein PUSH laufen, also geht keine Änderung
+   * verloren und keine kommt doppelt oder außer der Reihe.
+   */
+  private async catchUp(conn: Connection, room: Room, lastSeq: number, target: number): Promise<void> {
+    try {
+      let after = lastSeq;
+      for (let round = 0; round < CATCH_UP_ROUNDS; round++) {
+        const reached = await this.sendChanges(conn, room, after, target);
+        if (reached === null) return;
+        after = reached;
+        // Gelöschte Vaults haben keine Datensätze mehr; das klärt der letzte Schritt.
+        const head = await this.store.head(room.id);
+        if (head.deleted || head.seq - after <= CATCH_UP_TAIL) break;
+        target = head.seq;
+      }
+      this.runIn(conn, room, async () => {
+        const head = await this.store.head(room.id);
+        if (head.deleted) {
+          this.sendWs(conn.ws, VAULT_DELETED);
+          conn.ws.close(1000);
+          return;
+        }
+        if ((await this.sendChanges(conn, room, after, head.seq)) === null) return;
+        this.sendWs(conn.ws, encodeSynced(head.seq));
+        conn.live = true;
+      });
+    } catch (e) {
+      this.fail(conn, e);
+    }
+  }
+
+  /**
+   * Sendet die Datensätze mit `after < seq <= upTo` in Sequenz-Reihenfolge.
+   * Liefert die zuletzt erreichte Sequenznummer bzw. `null`, wenn die
+   * Verbindung dabei verloren ging oder den Raum verlassen hat.
+   */
+  private async sendChanges(conn: Connection, room: Room, after: number, upTo: number): Promise<number | null> {
+    while (after < upTo) {
+      if (conn.room !== room) return null;
+      const chunk = (await this.store.changesSince(room.id, after, CATCH_UP_CHUNK)).filter((c) => c.seq <= upTo);
+      if (chunk.length === 0) break;
+      // Jede Nachricht erst senden, wenn die vorige beim Socket angekommen ist:
+      // Ein Client, der nicht liest, kann so nicht den ganzen Vault in den
+      // Arbeitsspeicher des Servers ziehen.
+      for (const frame of framesOf(chunk)) {
+        if (!(await this.sendFlushed(conn.ws, frame))) return null;
+      }
+      after = chunk[chunk.length - 1]!.seq;
+    }
+    return conn.room === room ? after : null;
   }
 
   /**
@@ -536,6 +630,17 @@ export function describeIpSources(req: IncomingMessage, header: string): string 
     `IP-Header: ${ipHeaders.join(', ') || '–'}`,
     `weitere Header: ${others.join(', ') || '–'}`,
   ].join('; ');
+}
+
+/**
+ * Lehnt ein Upgrade ab. Upgrade-Sockets sind halboffen (`allowHalfOpen`) und
+ * blieben nach `end()` offen, solange der Client nicht selbst schließt.
+ */
+function reject(socket: Duplex, response: string): void {
+  socket.end(response);
+  const timer = setTimeout(() => socket.destroy(), REJECT_CLOSE_MS);
+  timer.unref();
+  socket.once('close', () => clearTimeout(timer));
 }
 
 function pathOf(req: IncomingMessage): string {

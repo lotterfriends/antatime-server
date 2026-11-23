@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
+import { connect as netConnect } from 'node:net';
+import type { Socket } from 'node:net';
 import { after, before, describe, test } from 'node:test';
 import WebSocket from 'ws';
 
 import { loadConfig } from '../src/config.ts';
 import { Database } from '../src/db.ts';
-import { ipKey } from '../src/limits.ts';
+import { DEFAULT_TRUSTED_PROXIES, TrustedProxies, clientIp, ipKey } from '../src/limits.ts';
 import { Op, Reader, encodeHello, encodePush } from '../src/protocol.ts';
 import { MemoryStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
@@ -299,6 +301,35 @@ describe('Limits pro IP', () => {
     assert.equal(ipKey('192.0.2.1'), '192.0.2.1');
   });
 
+  test('vertrauenswürdige Proxys: IPs, CIDR, IPv4-mapped IPv6', () => {
+    const def = new TrustedProxies(DEFAULT_TRUSTED_PROXIES);
+    for (const ip of ['127.0.0.1', '::1', '10.1.2.3', '::ffff:10.0.0.1', '172.31.255.255', '192.168.1.1', 'fd00::1']) {
+      assert.ok(def.has(ip), ip);
+    }
+    for (const ip of ['8.8.8.8', '172.32.0.1', '::ffff:8.8.8.8', '2001:db8::1', 'fe80::1', '']) {
+      assert.ok(!def.has(ip), ip);
+    }
+    const own = new TrustedProxies(['203.0.113.7', '2001:db8::/32', '198.51.100.0/24']);
+    assert.ok(own.has('203.0.113.7'));
+    assert.ok(own.has('::ffff:198.51.100.200'));
+    assert.ok(own.has('2001:db8:ffff::1'));
+    assert.ok(!own.has('203.0.113.8'));
+    assert.ok(!own.has('127.0.0.1'));
+
+    assert.deepEqual(loadConfig({}).trustedProxies, DEFAULT_TRUSTED_PROXIES);
+    assert.deepEqual(loadConfig({ TRUSTED_PROXIES: ' 10.0.0.1, fc00::/7 ' }).trustedProxies, ['10.0.0.1', 'fc00::/7']);
+    for (const bad of ['proxy.local', '10.0.0.0/33', '::1/129', '10.0.0.0/8/1', '10.0.0.0/x']) {
+      assert.throws(() => loadConfig({ TRUSTED_PROXIES: bad }), /TRUSTED_PROXIES/, bad);
+    }
+
+    const req = (remoteAddress: string | undefined) =>
+      ({ headers: { 'x-real-ip': '203.0.113.9' }, socket: { remoteAddress } }) as unknown as Parameters<typeof clientIp>[0];
+    assert.equal(clientIp(req('::ffff:192.168.0.2'), 'x-real-ip', def), '203.0.113.9');
+    assert.equal(clientIp(req('198.51.100.1'), 'x-real-ip', def), '198.51.100.1');
+    assert.equal(clientIp(req(undefined), 'x-real-ip', def), '203.0.113.9'); // Unix-Socket
+    assert.equal(clientIp(req('10.0.0.1'), '', def), '10.0.0.1');
+  });
+
   test('gleichzeitige Verbindungen pro IP, Freigabe beim Trennen', async () => {
     const { server, port } = await start({ maxConnectionsPerIp: 2 });
     try {
@@ -360,9 +391,9 @@ describe('Limits pro IP', () => {
     (ws as unknown as { _socket: { pause(): void } })._socket.pause();
   }
 
-  async function waitFor(cond: () => boolean, timeoutMs = 5000) {
+  async function waitFor(cond: () => boolean | Promise<boolean>, timeoutMs = 5000) {
     const deadline = Date.now() + timeoutMs;
-    while (!cond()) {
+    while (!(await cond())) {
       if (Date.now() > deadline) throw new Error('Zeitüberschreitung');
       await new Promise((r) => setTimeout(r, 20));
     }
@@ -430,6 +461,124 @@ describe('Limits pro IP', () => {
         await a.until((m) => m.op === 'ack', 10_000);
       }
       await waitFor(() => server.connectionCount === 1);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('Nachholen blockiert andere Geräte nicht und liefert jede Änderung genau einmal', async () => {
+    const { server, port } = await start({
+      messagesPerSecond: 1000,
+      uploadBytesPerIpPerMinute: 0,
+      sendStallTimeoutMs: 20_000,
+    });
+    try {
+      const vault = randomBytes(16);
+      const a = await fill(port, vault, 2000); // ≈ 32 MB, passt nicht in die Socket-Puffer
+
+      // Gerät, das nachholt, aber vorerst nichts liest.
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/sync`);
+      await new Promise((res, rej) => ws.once('open', res).once('error', rej));
+      const got: ServerMsg[] = [];
+      ws.on('message', (d) => got.push(decode(d as Buffer)));
+      const socket = (ws as unknown as { _socket: Socket })._socket;
+      ws.send(encodeHello(vault, 0));
+      socket.pause();
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Währenddessen werden Änderungen des anderen Geräts sofort bestätigt.
+      for (let i = 0; i < 3; i++) {
+        const k = Buffer.alloc(16);
+        k.writeUInt32BE(100_000 + i);
+        const started = Date.now();
+        a.send(encodePush(100 + i, [{ key: k, data: Buffer.from(`neu${i}`) }]));
+        assert.deepEqual(await a.until((m) => m.op === 'ack', 2000), [{ op: 'ack', reqId: 100 + i, first: 2001 + i }]);
+        assert.ok(Date.now() - started < 1000);
+      }
+      assert.ok(!got.some((m) => m.op === 'synced'));
+
+      socket.resume();
+      await waitFor(() => got.some((m) => m.op === 'synced'), 10_000);
+      // Eine Änderung nach SYNCED kommt live.
+      const k = Buffer.alloc(16);
+      k.writeUInt32BE(200_000);
+      a.send(encodePush(200, [{ key: k, data: Buffer.from('live') }]));
+      await a.until((m) => m.op === 'ack');
+      await waitFor(() => got.filter((m) => m.op === 'changes').some((m) => m.records.some((r) => r.seq === 2004)));
+
+      const seqs = got.flatMap((m) => (m.op === 'changes' ? m.records.map((r) => r.seq) : []));
+      assert.deepEqual(seqs, Array.from({ length: 2004 }, (_, i) => i + 1));
+      const syncedAt = got.findIndex((m) => m.op === 'synced');
+      assert.deepEqual(got[syncedAt], { op: 'synced', head: 2003 });
+      assert.equal(got.length, syncedAt + 2);
+      ws.close();
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('Client-IP-Header gilt nur von vertrauenswürdigen Proxys', async () => {
+    const { server, port } = await start({
+      maxConnectionsPerIp: 1,
+      clientIpHeader: 'x-forwarded-for',
+      trustedProxies: ['10.0.0.0/8'],
+    });
+    try {
+      // 127.0.0.1 ist hier kein Proxy: Der Header wird ignoriert, beide zählen als 127.0.0.1.
+      await Client.connect(port, { 'x-forwarded-for': '203.0.113.5' });
+      await assert.rejects(Client.connect(port, { 'x-forwarded-for': '203.0.113.6' }), /429/);
+      assert.deepEqual(server.drops.take(), { 'ipLimit(127.0.0.1)': 1 });
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('abgelehnte Upgrades: Abbruch durch den Client und halboffene Sockets', { timeout: 10_000 }, async () => {
+    const { server, port } = await start({});
+    const http = (server as unknown as { http: import('node:http').Server }).http;
+    const connections = () => new Promise<number>((res, rej) => http.getConnections((e, n) => (e ? rej(e) : res(n))));
+    const request = 'GET /falsch HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n';
+    let halfOpen: Socket | undefined;
+    try {
+      // Client setzt die Verbindung zurück, sobald die Ablehnung da ist → ECONNRESET beim Server.
+      for (let i = 0; i < 10; i++) {
+        const s = netConnect(port, '127.0.0.1');
+        s.on('error', () => {});
+        s.write(request);
+        await new Promise((r) => s.once('data', r));
+        s.resetAndDestroy();
+      }
+      // Halboffener Client, der nie schließt: Der Server muss den Socket trotzdem schließen.
+      const s = (halfOpen = netConnect({ port, host: '127.0.0.1', allowHalfOpen: true }));
+      s.on('error', () => {});
+      s.write(request);
+      const response = await new Promise<Buffer>((r) => s.once('data', r));
+      assert.match(response.toString(), /^HTTP\/1.1 404/);
+      await waitFor(async () => (await connections()) === 0);
+      // Der Server läuft weiter.
+      const c = await Client.connect(port);
+      c.close();
+      assert.equal(server.drops.take()['notFound'], 11);
+    } finally {
+      halfOpen?.destroy();
+      await server.close();
+    }
+  });
+
+  test('/health fragt die Datenbank höchstens alle 2 s', async () => {
+    const store = new MemoryStore();
+    let pings = 0;
+    store.ping = async () => {
+      pings++;
+      await new Promise((r) => setTimeout(r, 50));
+    };
+    const server = new SyncServer(loadConfig({}), store);
+    const port = await server.listen(0, '127.0.0.1');
+    try {
+      const res = await Promise.all(Array.from({ length: 5 }, () => fetch(`http://127.0.0.1:${port}/health`)));
+      assert.deepEqual(res.map((r) => r.status), [200, 200, 200, 200, 200]);
+      assert.equal((await fetch(`http://127.0.0.1:${port}/health`)).status, 200);
+      assert.equal(pings, 1);
     } finally {
       await server.close();
     }

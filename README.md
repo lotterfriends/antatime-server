@@ -71,6 +71,7 @@ DB_HOST=db.example.org DB_USER=antatime DB_PASSWORD=… DB_NAME=antatime \
 | `LOG_FILE` | – | Log-Ausgaben zusätzlich mit Zeitstempel an diese Datei anhängen – für Hoster, bei denen die Konsolenausgabe nicht einsehbar ist (z. B. Plesk/Passenger) |
 | `LOG_FILE_MAX_BYTES` | `5242880` | Ab dieser Größe wird die Logdatei nach `<LOG_FILE>.1` verschoben und neu begonnen (5 MB); `0` = nie |
 | `CLIENT_IP_HEADER` | – | hinter einem Proxy: Header mit der Client-IP, z. B. `x-forwarded-for` (letzter Eintrag zählt) oder `cf-connecting-ip` |
+| `TRUSTED_PROXIES` | Loopback und private Netze | kommagetrennte IPs/CIDR-Netze (IPv4 und IPv6), deren `CLIENT_IP_HEADER` geglaubt wird; bei allen anderen zählt die Socket-Adresse, damit niemand am Proxy vorbei eine fremde IP vorgeben kann. Standard: `127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7` (passt für Proxy auf demselben Rechner oder im Docker-Netz). Steht der Proxy unter einer öffentlichen Adresse, diese eintragen. Verbindungen ohne Socket-Adresse (Unix-Socket, z. B. Passenger) gelten als vertrauenswürdig |
 
 Limits mit dem Wert `0` sind abgeschaltet. Überschreitungen beantwortet der Server beim Verbindungsaufbau mit HTTP 429 und sonst mit `ERROR` (`4` = zu viel, `7` = Kontingent voll), danach trennt er die Verbindung. Die App verbindet sich mit Backoff neu. Ist die Client-IP nicht bekannt, warnt der Server einmal im Log, und die Limits pro IP greifen nicht.
 

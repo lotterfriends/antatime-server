@@ -1,4 +1,5 @@
 import type { IncomingMessage } from 'node:http';
+import { BlockList, isIPv4, isIPv6 } from 'node:net';
 
 /** Token-Bucket: [capacity] Einheiten, die mit [perSecond] nachlaufen. */
 export class TokenBucket {
@@ -112,19 +113,59 @@ export class IpLimiter {
   }
 }
 
+/** Standard für `TRUSTED_PROXIES`: Loopback und private Netze (Reverse-Proxy, Docker). */
+export const DEFAULT_TRUSTED_PROXIES = ['127.0.0.0/8', '::1', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', 'fc00::/7'];
+
+/**
+ * Adressen, deren Client-IP-Header geglaubt wird. Einträge: einzelne IPs oder
+ * CIDR-Netze, IPv4 und IPv6. Wirft bei ungültigen Einträgen.
+ */
+export class TrustedProxies {
+  private readonly list = new BlockList();
+
+  constructor(entries: readonly string[]) {
+    for (const raw of entries) {
+      const entry = raw.trim();
+      if (!entry) continue;
+      const [addr = '', bits, extra] = entry.split('/');
+      const family = isIPv4(addr) ? 'ipv4' : isIPv6(addr) ? 'ipv6' : null;
+      const max = family === 'ipv4' ? 32 : 128;
+      const prefix = bits === undefined ? max : Number(bits);
+      if (!family || extra !== undefined || !/^\d+$/.test(bits ?? '0') || prefix > max) {
+        throw new Error(`TRUSTED_PROXIES: ungültiger Eintrag „${entry}“`);
+      }
+      this.list.addSubnet(addr, prefix, family);
+    }
+  }
+
+  has(address: string): boolean {
+    const ip = address.replace(/^\[|\]$/g, '').replace(/%.*$/, '');
+    // IPv4-mapped (::ffff:10.0.0.1) muss auf IPv4-Einträge passen.
+    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(ip)?.[1];
+    if (mapped) return this.list.check(mapped, 'ipv4');
+    if (isIPv4(ip)) return this.list.check(ip, 'ipv4');
+    if (isIPv6(ip)) return this.list.check(ip, 'ipv6');
+    return false;
+  }
+}
+
 /**
  * Adresse des Clients. Hinter einem Reverse-Proxy steht sie in einem Header
  * ([header], z. B. `x-forwarded-for` oder `cf-connecting-ip`); bei
  * mehreren Einträgen zählt der letzte, den hat der eigene Proxy angehängt.
+ * Der Header zählt nur, wenn die Verbindung von einem [trusted] Proxy kommt –
+ * sonst könnte jeder, der den Port direkt erreicht, eine beliebige IP vorgeben
+ * und die Limits pro IP umgehen. Ohne Socket-Adresse (Unix-Socket, etwa bei
+ * Passenger) ist die Gegenstelle lokal und damit vertrauenswürdig.
  */
-export function clientIp(req: IncomingMessage, header: string): string | undefined {
-  if (header) {
+export function clientIp(req: IncomingMessage, header: string, trusted: TrustedProxies): string | undefined {
+  const addr = req.socket.remoteAddress;
+  if (header && (!addr || trusted.has(addr))) {
     const raw = req.headers[header.toLowerCase()];
     const value = Array.isArray(raw) ? raw[raw.length - 1] : raw;
     const ip = value?.split(',').pop()?.trim();
     if (ip) return ipKey(ip);
   }
-  const addr = req.socket.remoteAddress;
   return addr ? ipKey(addr) : undefined;
 }
 

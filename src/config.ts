@@ -1,3 +1,5 @@
+import { DEFAULT_TRUSTED_PROXIES, TrustedProxies } from './limits.ts';
+
 export interface DbConfig {
   host: string;
   port: number;
@@ -32,6 +34,8 @@ export interface Config {
   uploadBytesPerIpPerMinute: number;
   /** Header mit der Client-IP hinter einem Reverse-Proxy; leer = Socket-Adresse. */
   clientIpHeader: string;
+  /** Nur von diesen Adressen (IPs/CIDR) wird [clientIpHeader] geglaubt. */
+  trustedProxies: string[];
   /** Ohne HELLO innerhalb dieser Zeit wird die Verbindung getrennt. */
   helloTimeoutMs: number;
   /** Kontingent pro Vault (0 = unbegrenzt). */
@@ -53,6 +57,14 @@ function int(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
   const v = Number(raw);
   if (!Number.isInteger(v) || v < 0) throw new Error(`${name} muss eine ganze Zahl sein`);
   return v;
+}
+
+function proxyList(env: NodeJS.ProcessEnv, name: string, fallback: string[]): string[] {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const entries = raw.split(',').map((e) => e.trim()).filter((e) => e !== '');
+  new TrustedProxies(entries); // früh scheitern statt erst beim ersten Verbindungsaufbau
+  return entries;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -91,6 +103,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     connectsPerIpPerMinute: int(env, 'CONNECTS_PER_IP_PER_MINUTE', 30),
     uploadBytesPerIpPerMinute: int(env, 'UPLOAD_BYTES_PER_IP_PER_MINUTE', 10 * 1024 * 1024),
     clientIpHeader: (env['CLIENT_IP_HEADER'] ?? '').trim().toLowerCase(),
+    trustedProxies: proxyList(env, 'TRUSTED_PROXIES', DEFAULT_TRUSTED_PROXIES),
     helloTimeoutMs: int(env, 'HELLO_TIMEOUT_MS', 10_000),
     maxVaultRecords: int(env, 'MAX_VAULT_RECORDS', 100_000),
     maxVaultBytes: int(env, 'MAX_VAULT_BYTES', 64 * 1024 * 1024),
