@@ -11,7 +11,14 @@ import { DEFAULT_TRUSTED_PROXIES, TrustedProxies, clientIp, ipKey } from '../src
 import { Op, Reader, encodeHello, encodePush } from '../src/protocol.ts';
 import { MemoryStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
-import { DropStats, SyncServer, describeIpSources } from '../src/sync-server.ts';
+import {
+  DropStats,
+  MAX_QUEUED_PUSHES,
+  MAX_QUEUED_PUSH_BYTES,
+  SyncServer,
+  describeIpSources,
+  vaultHash,
+} from '../src/sync-server.ts';
 
 type ServerMsg =
   | { op: 'changes'; records: { seq: number; key: string; data: string }[] }
@@ -36,8 +43,14 @@ function decode(buf: Buffer): ServerMsg {
       }
       return { op: 'changes', records };
     }
-    case Op.synced:
-      return { op: 'synced', head: r.varint() };
+    case Op.synced: {
+      // serverTime und Epoche müssen immer dabei sein; die Epoche liest syncedEpoch().
+      const head = r.varint();
+      r.varint();
+      r.varint();
+      assert.ok(r.done);
+      return { op: 'synced', head };
+    }
     case Op.ack:
       return { op: 'ack', reqId: r.varint(), first: r.varint() };
     case Op.pong:
@@ -50,17 +63,29 @@ function decode(buf: Buffer): ServerMsg {
   throw new Error(`unbekannt ${op}`);
 }
 
+function syncedEpoch(buf: Buffer): number {
+  const r = new Reader(buf);
+  r.u8();
+  r.varint();
+  r.varint();
+  return r.varint();
+}
+
 /** Minimaler Test-Client, der alle Server-Nachrichten sammelt. */
 class Client {
   readonly messages: ServerMsg[] = [];
   private waiters: (() => void)[] = [];
   private readonly ws: WebSocket;
   closed = false;
+  /** Epoche aus dem letzten SYNCED. */
+  epoch: number | undefined;
 
   private constructor(ws: WebSocket) {
     this.ws = ws;
     ws.on('message', (d) => {
-      this.messages.push(decode(d as Buffer));
+      const m = decode(d as Buffer);
+      if (m.op === 'synced') this.epoch = syncedEpoch(d as Buffer);
+      this.messages.push(m);
       this.wake();
     });
     ws.on('close', () => {
@@ -221,6 +246,38 @@ function suite(name: string, makeStore: () => Promise<Store>) {
       assert.deepEqual(err2 && err2.op === 'error' && err2.code, 2);
     });
 
+    test('Epoche bleibt gleich und wechselt, wenn der Vault neu angelegt wird', async () => {
+      const vault = randomBytes(16);
+      const a = await Client.connect(port);
+      await a.hello(vault);
+      const first = a.epoch!;
+      assert.ok(first > 0 && first < 2 ** 48);
+      a.send(encodePush(1, [rec(1, 'eins')]));
+      await a.until((m) => m.op === 'ack');
+      const b = await Client.connect(port);
+      await b.hello(vault, 1);
+      assert.equal(b.epoch, first);
+      a.close();
+      b.close();
+      await a.until(() => false, 200).catch(() => {});
+
+      // Nur diesen Vault ablaufen lassen (die Datenbank kann weitere enthalten).
+      const id = vaultHash(vault);
+      assert.equal(await store.expire(new Date(Date.now() + 60_000), (v) => !v.equals(id)), 1);
+
+      // Ein Gerät mit altem Stand sieht an der neuen Epoche, dass lastSeq nicht mehr gilt.
+      const c = await Client.connect(port);
+      assert.deepEqual(await c.hello(vault, 1), [{ op: 'synced', head: 0 }]);
+      assert.ok(c.epoch! > 0 && c.epoch !== first);
+      c.send(encodePush(1, [rec(2, 'zwei')]));
+      assert.deepEqual(await c.until((m) => m.op === 'ack'), [{ op: 'ack', reqId: 1, first: 1 }]);
+      const d = await Client.connect(port);
+      await d.hello(vault);
+      assert.equal(d.epoch, c.epoch);
+      c.close();
+      d.close();
+    });
+
     test('Kontingent pro Vault: Anzahl und Bytes', async () => {
       const limited = new SyncServer(
         { ...loadConfig({}), messagesPerSecond: 1000, maxVaultRecords: 2, maxVaultBytes: 10 },
@@ -358,7 +415,7 @@ describe('Limits pro IP', () => {
     try {
       for (let i = 0; i < 3; i++) (await Client.connect(port)).close();
       await assert.rejects(Client.connect(port), /429/);
-      assert.deepEqual(server.drops.take(), { 'ipLimit(127.0.0.1)': 1 });
+      assert.deepEqual(server.drops.take(), { ipLimit: 1 });
     } finally {
       await server.close();
     }
@@ -527,7 +584,7 @@ describe('Limits pro IP', () => {
       // 127.0.0.1 ist hier kein Proxy: Der Header wird ignoriert, beide zählen als 127.0.0.1.
       await Client.connect(port, { 'x-forwarded-for': '203.0.113.5' });
       await assert.rejects(Client.connect(port, { 'x-forwarded-for': '203.0.113.6' }), /429/);
-      assert.deepEqual(server.drops.take(), { 'ipLimit(127.0.0.1)': 1 });
+      assert.deepEqual(server.drops.take(), { ipLimit: 1 });
     } finally {
       await server.close();
     }
@@ -629,6 +686,151 @@ describe('Limits pro IP', () => {
       // Der Tombstone ist weg, der Code wieder verwendbar.
       const d = await Client.connect(port);
       assert.deepEqual(await d.hello(gone, 0), [{ op: 'synced', head: 0 }]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('Ablauf überspringt Vaults mit verbundenen Geräten', async () => {
+    const { server, port } = await start({ messagesPerSecond: 1000, vaultTtlDays: 0 });
+    try {
+      const kept = randomBytes(16);
+      const gone = randomBytes(16);
+      const a = await Client.connect(port);
+      await a.hello(kept);
+      a.send(encodePush(1, [rec(1, 'eins')]));
+      await a.until((m) => m.op === 'ack');
+      const keptEpoch = a.epoch;
+      const b = await Client.connect(port);
+      await b.hello(gone);
+      b.send(encodePush(1, [rec(1, 'x')]));
+      await b.until((m) => m.op === 'ack');
+      const goneEpoch = b.epoch;
+      b.close();
+      await b.until(() => false, 200).catch(() => {});
+
+      await new Promise((r) => setTimeout(r, 10));
+      await server.expireVaults(); // TTL 0: alles ohne Verbindung läuft ab
+      a.send(encodePush(2, [rec(2, 'zwei')]));
+      assert.deepEqual(await a.until((m) => m.op === 'ack'), [{ op: 'ack', reqId: 2, first: 2 }]);
+      const c = await Client.connect(port);
+      assert.deepEqual(await c.hello(kept, 2), [{ op: 'synced', head: 2 }]);
+      assert.equal(c.epoch, keptEpoch);
+      const d = await Client.connect(port);
+      assert.deepEqual(await d.hello(gone, 1), [{ op: 'synced', head: 0 }]);
+      assert.notEqual(d.epoch, goneEpoch);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('MAX_CONNECTIONS zählt Upgrades selbst und gibt sie wieder frei', async () => {
+    const { server, port } = await start({ maxConnections: 1 });
+    try {
+      // Fehlgeschlagenes Upgrade (ohne Sec-WebSocket-Key) belegt danach keinen Platz.
+      const s = netConnect(port, '127.0.0.1');
+      s.on('error', () => {});
+      s.write('GET /sync HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n');
+      const response = await new Promise<Buffer>((r) => s.once('data', r));
+      assert.match(response.toString(), /^HTTP\/1.1 400/);
+      await new Promise((r) => s.once('close', r));
+
+      const a = await Client.connect(port);
+      await assert.rejects(Client.connect(port), /503/);
+      a.close();
+      await a.until(() => false, 200).catch(() => {});
+      (await Client.connect(port)).close();
+      assert.equal(server.drops.take()['serverFull'], 1);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test('MESSAGES_PER_SECOND=0 heißt unbegrenzt', async () => {
+    const { server, port } = await start({ messagesPerSecond: 0 });
+    try {
+      const a = await Client.connect(port);
+      for (let i = 0; i < 50; i++) a.send(Buffer.from([Op.ping]));
+      let pongs = 0;
+      await a.until((m) => m.op === 'pong' && ++pongs === 50);
+      assert.equal(loadConfig({ MESSAGES_PER_SECOND: '0' }).messagesPerSecond, 0);
+    } finally {
+      await server.close();
+    }
+  });
+
+  /** Server, dessen Speicher PUSHes erst nach `release()` ausführt. */
+  async function stalledServer() {
+    const store = new MemoryStore();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const put = store.put.bind(store);
+    store.put = async (...args) => {
+      await gate;
+      return put(...args);
+    };
+    const server = new SyncServer(
+      { ...loadConfig({}), messagesPerSecond: 1000, uploadBytesPerIpPerMinute: 0 },
+      store,
+    );
+    return { server, port: await server.listen(0, '127.0.0.1'), release };
+  }
+
+  test('zu viele unbestätigte PUSHes pro Verbindung', async () => {
+    const { server, port, release } = await stalledServer();
+    try {
+      const a = await Client.connect(port);
+      await a.hello(randomBytes(16));
+      for (let i = 0; i <= MAX_QUEUED_PUSHES; i++) a.send(encodePush(i, [rec(i, 'x')]));
+      const msgs = await a.until((m) => m.op === 'error');
+      assert.deepEqual(msgs, [{ op: 'error', code: 4, message: 'Zu viele unbestätigte Änderungen' }]);
+      // Eine andere Verbindung desselben Servers ist davon nicht betroffen.
+      const b = await Client.connect(port);
+      await b.hello(randomBytes(16));
+      b.send(encodePush(1, [rec(1, 'x')]));
+      release();
+      await b.until((m) => m.op === 'ack');
+    } finally {
+      release();
+      await server.close();
+    }
+  });
+
+  test('zu viele unbestätigte Bytes pro Verbindung', async () => {
+    const { server, port, release } = await stalledServer();
+    try {
+      const a = await Client.connect(port);
+      await a.hello(randomBytes(16));
+      const data = Buffer.from('x'.repeat(16 * 1024));
+      const push = (n: number) => {
+        const batch = [];
+        for (let j = 0; j < 200; j++) {
+          const k = Buffer.alloc(16);
+          k.writeUInt32BE(n * 1000 + j);
+          batch.push({ key: k, data });
+        }
+        return encodePush(n, batch);
+      };
+      const perPush = 200 * (16 + data.length);
+      const fit = Math.floor(MAX_QUEUED_PUSH_BYTES / perPush);
+      assert.ok(fit < MAX_QUEUED_PUSHES);
+      for (let i = 0; i <= fit; i++) a.send(push(i));
+      const [err] = await a.until((m) => m.op === 'error', 10_000);
+      assert.equal(err?.op === 'error' && err.code, 4);
+    } finally {
+      release();
+      await server.close();
+    }
+  });
+
+  test('gleichzeitige PUSHes in verschiedene Vaults überschreiten das Gesamt-Kontingent nicht', async () => {
+    const { server, port } = await start({ messagesPerSecond: 1000, maxTotalBytes: 10 });
+    try {
+      const clients = await Promise.all([0, 1, 2].map(() => Client.connect(port)));
+      for (const c of clients) await c.hello(randomBytes(16));
+      clients.forEach((c, i) => c.send(encodePush(1, [rec(i, 'xxxxxx')])));
+      const results = await Promise.all(clients.map((c) => c.until((m) => m.op === 'ack' || m.op === 'error')));
+      assert.deepEqual(results.map((r) => r.at(-1)!.op).sort(), ['ack', 'error', 'error']);
     } finally {
       await server.close();
     }

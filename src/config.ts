@@ -22,7 +22,7 @@ export interface Config {
   maxMessageBytes: number;
   /** Maximale Anzahl gleichzeitiger Verbindungen pro Vault (0 = unbegrenzt). */
   maxConnectionsPerVault: number;
-  /** Erlaubte Nachrichten pro Sekunde und Verbindung (Mittelwert, Burst = 10×). */
+  /** Erlaubte Nachrichten pro Sekunde und Verbindung (Mittelwert, Burst = 10×; 0 = unbegrenzt). */
   messagesPerSecond: number;
   /** Gleichzeitige Verbindungen insgesamt (0 = unbegrenzt). */
   maxConnections: number;

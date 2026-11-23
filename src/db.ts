@@ -3,13 +3,14 @@ import type { Pool, RowDataPacket } from 'mysql2/promise';
 
 import type { DbConfig } from './config.ts';
 import type { SyncRecord, StoredRecord } from './protocol.ts';
-import { applyQuota } from './store.ts';
-import type { Quota, Store } from './store.ts';
+import { applyQuota, newEpoch } from './store.ts';
+import type { Head, Quota, Store } from './store.ts';
 
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS vaults (
      id         BINARY(32)      NOT NULL,
      seq        BIGINT UNSIGNED NOT NULL DEFAULT 0,
+     epoch      BIGINT UNSIGNED NOT NULL DEFAULT 0,
      deleted    BOOLEAN         NOT NULL DEFAULT FALSE,
      records    INT UNSIGNED    NOT NULL DEFAULT 0,
      bytes      BIGINT UNSIGNED NOT NULL DEFAULT 0,
@@ -39,6 +40,12 @@ export class Database implements Store {
   private readonly pool: Pool;
   /** Gesamtbelegung aller Vaults; zwischen zwei Abfragen fortgeschrieben. */
   private total: { bytes: number; at: number } | null = null;
+  /**
+   * Zuwachs der Pushes, die das Kontingent schon geprüft, aber noch nicht
+   * verbucht haben. Er zählt zur Gesamtbelegung, sonst könnten gleichzeitige
+   * Pushes in verschiedene Vaults das Gesamt-Kontingent gemeinsam überschreiten.
+   */
+  private reserved = 0;
 
   constructor(config: DbConfig) {
     this.pool = mysql.createPool({
@@ -76,6 +83,12 @@ export class Database implements Store {
     );
     const have = new Set(cols.map((c) => String(c['COLUMN_NAME']).toLowerCase()));
     if (!have.has('bytes')) await this.migrateQuota();
+    if (!have.has('epoch')) {
+      // Bestehende Vaults behalten Epoche 0 („vor den Epochen“); erst neu
+      // angelegte bekommen eine zufällige.
+      console.log('Datenbank: ergänze Spalte für die Vault-Epoche …');
+      await this.pool.query('ALTER TABLE vaults ADD COLUMN epoch BIGINT UNSIGNED NOT NULL DEFAULT 0 AFTER seq');
+    }
     if (!have.has('active_at')) {
       console.log('Datenbank: ergänze Spalte für den Ablauf inaktiver Vaults …');
       await this.pool.query(
@@ -111,14 +124,14 @@ export class Database implements Store {
     await this.pool.query('SELECT 1');
   }
 
-  /** Stand des Vaults; `deleted` = Code wurde gelöscht und ist verbrannt. */
-  async head(vault: Buffer): Promise<{ seq: number; deleted: boolean }> {
+  async head(vault: Buffer): Promise<Head> {
     const [rows] = await this.pool.query<RowDataPacket[]>(
-      'SELECT seq, deleted FROM vaults WHERE id = ?',
+      'SELECT seq, deleted, epoch FROM vaults WHERE id = ?',
       [vault],
     );
-    if (!rows.length) return { seq: 0, deleted: false };
-    return { seq: Number(rows[0]!['seq']), deleted: Boolean(rows[0]!['deleted']) };
+    if (!rows.length) return { seq: 0, deleted: false, epoch: 0 };
+    const row = rows[0]!;
+    return { seq: Number(row['seq']), deleted: Boolean(row['deleted']), epoch: Number(row['epoch']) };
   }
 
   /** Datensätze mit seq > [after], aufsteigend, höchstens [limit]. */
@@ -140,11 +153,13 @@ export class Database implements Store {
    */
   async put(vault: Buffer, records: SyncRecord[], quota: Quota): Promise<number | null> {
     const n = records.length;
-    const total = quota.maxTotalBytes > 0 ? await this.totalBytes() : 0;
-    const conn = await this.pool.getConnection();
+    let reserve = 0;
+    let conn;
     try {
+      const fetchedTotal = quota.maxTotalBytes > 0 ? await this.totalBytes() : 0;
+      conn = await this.pool.getConnection();
       await conn.beginTransaction();
-      await conn.query('INSERT IGNORE INTO vaults (id) VALUES (?)', [vault]);
+      await conn.query('INSERT IGNORE INTO vaults (id, epoch) VALUES (?, ?)', [vault, newEpoch()]);
       const [rows] = await conn.query<RowDataPacket[]>(
         'SELECT seq, deleted, records, bytes FROM vaults WHERE id = ? FOR UPDATE',
         [vault],
@@ -159,6 +174,9 @@ export class Database implements Store {
         [vault, records.map((r) => r.key)],
       );
       const existing = new Map(old.map((r) => [(r['rkey'] as Buffer).toString('hex'), Number(r['len'])]));
+      // Prüfen und Reservieren ohne await dazwischen, ebenso unten Verbuchen
+      // und Freigeben: So zählt jeder Zuwachs genau einmal.
+      const total = (this.total?.bytes ?? fetchedTotal) + this.reserved;
       const usage = applyQuota(
         { records: Number(head['records']), bytes: Number(head['bytes']) },
         existing,
@@ -166,6 +184,8 @@ export class Database implements Store {
         quota,
         total,
       );
+      reserve = Math.max(0, usage.bytes - Number(head['bytes']));
+      this.reserved += reserve;
       const first = Number(head['seq']) + 1;
       await conn.query('UPDATE vaults SET seq = ?, records = ?, bytes = ?, active_at = NOW() WHERE id = ?', [
         first + n - 1,
@@ -183,10 +203,11 @@ export class Database implements Store {
       if (this.total) this.total.bytes += usage.bytes - Number(head['bytes']);
       return first;
     } catch (e) {
-      await conn.rollback().catch(() => {});
+      await conn?.rollback().catch(() => {});
       throw e;
     } finally {
-      conn.release();
+      this.reserved -= reserve;
+      conn?.release();
     }
   }
 
@@ -201,9 +222,9 @@ export class Database implements Store {
       await conn.beginTransaction();
       await conn.query('DELETE FROM records WHERE vault = ?', [vault]);
       await conn.query(
-        'INSERT INTO vaults (id, deleted) VALUES (?, TRUE) ' +
+        'INSERT INTO vaults (id, deleted, epoch) VALUES (?, TRUE, ?) ' +
           'ON DUPLICATE KEY UPDATE deleted = TRUE, records = 0, bytes = 0, active_at = NOW()',
-        [vault],
+        [vault, newEpoch()],
       );
       await conn.commit();
     } catch (e) {
@@ -215,14 +236,16 @@ export class Database implements Store {
   }
 
   async touch(vault: Buffer): Promise<void> {
-    // Höchstens einmal pro Stunde schreiben, sonst kostet jedes HELLO ein UPDATE.
+    // Fehlt der Vault, wird er angelegt. `active_at` höchstens einmal pro
+    // Stunde schreiben, sonst kostet jedes HELLO eine Änderung.
     await this.pool.query(
-      'UPDATE vaults SET active_at = NOW() WHERE id = ? AND active_at < NOW() - INTERVAL 1 HOUR',
-      [vault],
+      'INSERT INTO vaults (id, epoch) VALUES (?, ?) ' +
+        'ON DUPLICATE KEY UPDATE active_at = IF(active_at < NOW() - INTERVAL 1 HOUR, NOW(), active_at)',
+      [vault, newEpoch()],
     );
   }
 
-  async expire(before: Date): Promise<number> {
+  async expire(before: Date, keep?: (vault: Buffer) => boolean): Promise<number> {
     // Relativ zu NOW() rechnen: Ein Date-Parameter würde in der Zeitzone von
     // Node übergeben, verglichen wird aber in der Zeitzone der Datenbank.
     const age = Math.round((Date.now() - before.getTime()) / 1000);
@@ -234,6 +257,7 @@ export class Database implements Store {
       );
       if (!rows.length) break;
       for (const row of rows) {
+        if (keep?.(row['id'] as Buffer)) continue;
         // Einzeln und erneut geprüft: Ein Gerät kann sich inzwischen gemeldet haben.
         const conn = await this.pool.getConnection();
         try {

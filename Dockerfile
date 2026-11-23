@@ -37,6 +37,7 @@ ENV NODE_ENV=production PORT=8080
 COPY --from=build /src/dist/antatime-server.cjs ./antatime-server.cjs
 USER node
 EXPOSE 8080
+# Shell-Form, damit ein abweichender PORT zur Laufzeit gilt.
 HEALTHCHECK --interval=15s --timeout=3s --start-period=20s \
-  CMD wget -qO- http://127.0.0.1:8080/health >/dev/null || exit 1
+  CMD wget -qO- "http://127.0.0.1:${PORT:-8080}/health" >/dev/null || exit 1
 CMD ["node", "antatime-server.cjs"]

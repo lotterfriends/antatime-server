@@ -57,14 +57,14 @@ DB_HOST=db.example.org DB_USER=antatime DB_PASSWORD=… DB_NAME=antatime \
 | `MAX_RECORDS_PER_PUSH` | `1000` | |
 | `MAX_MESSAGE_BYTES` | `4194304` | WebSocket-Nachricht |
 | `MAX_CONNECTIONS_PER_VAULT` | `0` | gleichzeitige Verbindungen pro Code, `0` = unbegrenzt (alle Apps mit demselben Code können gleichzeitig offen sein) |
-| `MESSAGES_PER_SECOND` | `20` | pro Verbindung (Burst 10×) |
+| `MESSAGES_PER_SECOND` | `20` | pro Verbindung (Burst 10×), `0` = unbegrenzt |
 | `MAX_CONNECTIONS` | `5000` | gleichzeitige Verbindungen insgesamt |
 | `MAX_CONNECTIONS_PER_IP` | `20` | gleichzeitig pro IP (IPv6: pro /64-Netz) |
 | `CONNECTS_PER_IP_PER_MINUTE` | `30` | neue Verbindungen pro IP und Minute |
 | `UPLOAD_BYTES_PER_IP_PER_MINUTE` | `10485760` | hochgeladene Bytes pro IP und Minute (10 MB) |
 | `MAX_VAULT_RECORDS` / `MAX_VAULT_BYTES` | `100000` / `67108864` | Speicher-Kontingent pro Sync-Code (64 MB) |
-| `MAX_TOTAL_BYTES` | `10737418240` | Speicher aller Sync-Codes zusammen (10 GB); danach nimmt der Server nur noch Änderungen an, die nichts vergrößern |
-| `VAULT_TTL_DAYS` | `365` | Sync-Codes, die so lange kein Gerät benutzt hat, werden entfernt (auch gelöschte); kehrt ein Gerät zurück, lädt es seine Daten neu hoch. `0` = nie |
+| `MAX_TOTAL_BYTES` | `10737418240` | Speicher aller Sync-Codes zusammen (10 GB); danach nimmt der Server nur noch Änderungen an, die nichts vergrößern. Weiches Limit: Die Gesamtbelegung wird nur alle 10 s aus der Datenbank gelesen und dazwischen im Prozess fortgeschrieben (gleichzeitige Pushes eingerechnet); Schreiben andere Prozesse in dieselbe Datenbank, kann es um deren Zuwachs überschritten werden |
+| `VAULT_TTL_DAYS` | `365` | Sync-Codes, die so lange kein Gerät benutzt hat, werden entfernt (auch gelöschte, nie solche mit verbundenem Gerät); kehrt ein Gerät zurück, erkennt es an der neuen Epoche in `SYNCED`, dass der Vault neu angelegt wurde, und lädt seine Daten neu hoch. `0` = nie |
 | `HELLO_TIMEOUT_MS` | `10000` | Verbindungen ohne HELLO werden danach getrennt |
 | `MAX_SEND_BUFFER_BYTES` | `4194304` | Ungelesene Sendedaten pro Verbindung (4 MB); darüber wird getrennt |
 | `SEND_STALL_TIMEOUT_MS` | `30000` | Liest ein Client beim Nachholen so lange nichts, wird getrennt |
@@ -73,7 +73,7 @@ DB_HOST=db.example.org DB_USER=antatime DB_PASSWORD=… DB_NAME=antatime \
 | `CLIENT_IP_HEADER` | – | hinter einem Proxy: Header mit der Client-IP, z. B. `x-forwarded-for` (letzter Eintrag zählt) oder `cf-connecting-ip` |
 | `TRUSTED_PROXIES` | Loopback und private Netze | kommagetrennte IPs/CIDR-Netze (IPv4 und IPv6), deren `CLIENT_IP_HEADER` geglaubt wird; bei allen anderen zählt die Socket-Adresse, damit niemand am Proxy vorbei eine fremde IP vorgeben kann. Standard: `127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7` (passt für Proxy auf demselben Rechner oder im Docker-Netz). Steht der Proxy unter einer öffentlichen Adresse, diese eintragen. Verbindungen ohne Socket-Adresse (Unix-Socket, z. B. Passenger) gelten als vertrauenswürdig |
 
-Limits mit dem Wert `0` sind abgeschaltet. Überschreitungen beantwortet der Server beim Verbindungsaufbau mit HTTP 429 und sonst mit `ERROR` (`4` = zu viel, `7` = Kontingent voll), danach trennt er die Verbindung. Die App verbindet sich mit Backoff neu. Ist die Client-IP nicht bekannt, warnt der Server einmal im Log, und die Limits pro IP greifen nicht.
+Limits mit dem Wert `0` sind abgeschaltet. Außerdem nimmt der Server pro Verbindung höchstens 8 unbestätigte PUSHes bzw. 16 MB an. Überschreitungen beantwortet der Server beim Verbindungsaufbau mit HTTP 429 und sonst mit `ERROR` (`4` = zu viel, `7` = Kontingent voll), danach trennt er die Verbindung. Die App verbindet sich mit Backoff neu. Ist die Client-IP nicht bekannt, warnt der Server einmal im Log, und die Limits pro IP greifen nicht.
 
 **TLS:** Der Server spricht selbst nur HTTP/`ws://`. Öffentlich gehört ein Reverse-Proxy mit TLS davor (Caddy, nginx, Traefik), der WebSocket-Upgrades auf `/sync` durchreicht. Die Inhalte sind zwar ohnehin verschlüsselt, TLS schützt aber die Metadaten (Vault-ID, Zeitpunkte, Größen). Eine per HTTPS ausgelieferte Web-App kann außerdem nur `wss://` verwenden.
 
@@ -121,7 +121,7 @@ WebSocket `/sync`, nur Binär-Frames. Erstes Byte = Opcode, Zahlen als LEB128-Va
 | C→S | `0x03` DELETE_VAULT | – |
 | C→S | `0x04` PING | – |
 | S→C | `0x81` CHANGES | `varint n, n × (varint seq, key, varint len, data)` |
-| S→C | `0x82` SYNCED | `varint headSeq` – Nachholen abgeschlossen |
+| S→C | `0x82` SYNCED | `varint headSeq, varint serverTime, varint epoch` – Nachholen abgeschlossen; `serverTime` = Serveruhr in ms seit 1970, `epoch` = Generation des Vaults (siehe unten). Ältere Server senden nur `headSeq` bzw. `headSeq, serverTime` |
 | S→C | `0x83` ACK | `varint reqId, varint firstSeq` – Seqs `firstSeq … firstSeq+n−1` |
 | S→C | `0x84` PONG | – |
 | S→C | `0x85` VAULT_DELETED | – |
@@ -132,6 +132,8 @@ Ablauf:
 1. Client sendet `HELLO` mit der zuletzt übernommenen Sequenznummer.
 2. Server schickt alle Datensätze mit größerer Nummer (in Blöcken zu 500) und dann `SYNCED`. Pro Schlüssel wird nur der neueste Stand gespeichert, ein Gerät, das lange offline war, lädt also nur die aktuellen Datensätze.
 3. Danach: `PUSH` → Server vergibt fortlaufende Nummern, verteilt `CHANGES` sofort an die anderen Geräte des Vaults und bestätigt mit `ACK`.
+
+**Epoche:** Läuft ein Vault ab und wird später neu angelegt, beginnen die Sequenznummern wieder bei 1. Damit ein Gerät mit altem `lastSeq` dabei nichts verpasst, trägt jeder Vault eine zufällige Epoche (48 Bit, nie 0), die sich nur beim Neuanlegen ändert; Vaults aus der Zeit vor den Epochen haben `0`. Der Server legt den Vault schon beim `HELLO` an, sodass bereits das erste `SYNCED` die gültige Epoche trägt. Weicht sie von der gemerkten ab, verwirft der Client `lastSeq`, holt ab `0` nach und lädt seine Daten neu hoch.
 
 Alle Aufgaben eines Vaults laufen auf dem Server strikt nacheinander. Daher gilt pro Verbindung: Fremde Änderungen kommen in Reihenfolge an, und vor einem `ACK` sind alle kleineren Nummern bereits zugestellt. Der Client kann seinen Stand also ohne Lücken auf `firstSeq+n−1` setzen und lädt eigene Änderungen nie erneut herunter.
 

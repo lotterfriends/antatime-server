@@ -57,15 +57,20 @@ test('Ungültige Nachrichten werden abgelehnt', () => {
   }
 });
 
-test('SYNCED enthält die Uhrzeit des Servers', () => {
-  const r = new Reader(encodeSynced(3, 1_790_000_000_000));
+test('SYNCED enthält Uhrzeit des Servers und Epoche', () => {
+  const epoch = 2 ** 48 - 1;
+  const r = new Reader(encodeSynced(3, epoch, 1_790_000_000_000));
   assert.equal(r.u8(), Op.synced);
   assert.equal(r.varint(), 3);
   assert.equal(r.varint(), 1_790_000_000_000);
+  assert.equal(r.varint(), epoch);
   assert.ok(r.done);
 
-  const now = new Reader(encodeSynced(0));
+  // Epoche 0 (Vault von vor den Epochen) wird trotzdem mitgeschickt.
+  const now = new Reader(encodeSynced(0, 0));
   now.u8();
   now.varint();
   assert.ok(Math.abs(now.varint() - Date.now()) < 1000);
+  assert.equal(now.varint(), 0);
+  assert.ok(now.done);
 });

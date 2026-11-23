@@ -12,10 +12,15 @@
  *
  * Server → Client
  *   0x81 CHANGES       varint n, n × { varint seq, key, varint len, data }
- *   0x82 SYNCED        varint headSeq, [varint serverTime]  (Nachholen abgeschlossen;
- *                      serverTime = Uhrzeit des Servers in ms seit 1970, damit
- *                      Clients eine falsch gehende Geräteuhr erkennen. Ältere
- *                      Clients ignorieren das Feld.)
+ *   0x82 SYNCED        varint headSeq, [varint serverTime], [varint epoch]
+ *                      Nachholen abgeschlossen. serverTime = Uhrzeit des Servers
+ *                      in ms seit 1970, damit Clients eine falsch gehende
+ *                      Geräteuhr erkennen. epoch = Kennung der Vault-Generation:
+ *                      wechselt, wenn der Vault neu angelegt wird (etwa nach dem
+ *                      Ablauf); 0 = Vault von vor den Epochen. Weicht sie von
+ *                      der gemerkten ab, gilt lastSeq nicht mehr – der Client
+ *                      holt ab 0 nach und lädt seine Daten neu hoch. Der Server
+ *                      sendet immer beide Felder; ältere Clients ignorieren sie.
  *   0x83 ACK           varint reqId, varint firstSeq (Seqs firstSeq … firstSeq+n−1)
  *   0x84 PONG
  *   0x85 VAULT_DELETED
@@ -229,8 +234,8 @@ export function encodeChanges(records: StoredRecord[]): Buffer {
   return w.finish();
 }
 
-export function encodeSynced(headSeq: number, serverTime = Date.now()): Buffer {
-  return new Writer().u8(Op.synced).varint(headSeq).varint(serverTime).finish();
+export function encodeSynced(headSeq: number, epoch: number, serverTime = Date.now()): Buffer {
+  return new Writer().u8(Op.synced).varint(headSeq).varint(serverTime).varint(epoch).finish();
 }
 
 export function encodeAck(reqId: number, firstSeq: number): Buffer {

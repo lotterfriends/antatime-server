@@ -9,8 +9,9 @@ services:
       MYSQL_USER: antatime
       MYSQL_PASSWORD: antatime
       MYSQL_ROOT_PASSWORD: root
+    # Nur für die lokale Entwicklung erreichbar, nicht aus dem Netz.
     ports:
-      - "${MYSQL_PORT:-3306}:3306"
+      - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
@@ -31,6 +32,8 @@ services:
       DB_USER: antatime
       DB_PASSWORD: antatime
       DB_NAME: antatime
+    # Hinter einem Reverse-Proxy auf demselben Rechner besser nur lokal binden:
+    #   "127.0.0.1:${SERVER_PORT:-8080}:8080"
     ports:
       - "${SERVER_PORT:-8080}:8080"
     depends_on:

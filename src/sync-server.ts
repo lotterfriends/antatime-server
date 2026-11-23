@@ -43,6 +43,13 @@ const REJECT_CLOSE_MS = 1000;
  */
 const CATCH_UP_TAIL = CATCH_UP_CHUNK;
 const CATCH_UP_ROUNDS = 3;
+/**
+ * Unbestätigte PUSHes pro Verbindung (Anzahl bzw. Bytes). Darüber wird mit
+ * `rateLimited` getrennt, sonst könnte ein Client bei langsamer Datenbank
+ * beliebig viel in der Warteschlange seines Vaults parken.
+ */
+export const MAX_QUEUED_PUSHES = 8;
+export const MAX_QUEUED_PUSH_BYTES = 16 * 1024 * 1024;
 
 /**
  * Zählt, warum Verbindungen abgelehnt oder getrennt wurden, und schreibt die
@@ -117,6 +124,9 @@ interface Connection {
   /** Client-IP (IPv6: /64), `undefined` wenn unbekannt → keine IP-Limits. */
   ip: string | undefined;
   helloTimer: NodeJS.Timeout | undefined;
+  /** PUSHes in der Warteschlange des Vaults (laufend oder wartend) und ihre Größe. */
+  queued: number;
+  queuedBytes: number;
 }
 
 export class SyncServer {
@@ -135,6 +145,11 @@ export class SyncServer {
   private health: { at: number; ok: Promise<boolean> } | null = null;
   /** Laufendes Nachholen außerhalb der Warteschlangen; `close()` wartet darauf. */
   private readonly catchUps = new Set<Promise<void>>();
+  /**
+   * Angenommene Upgrade-Sockets bis zu ihrem Schließen. `wss.clients` enthält
+   * Upgrades, die noch laufen, nicht und taugt daher nicht für `maxConnections`.
+   */
+  private sockets = 0;
   private warnedUnknownIp = false;
   private warnedUntrusted = false;
   readonly drops = new DropStats();
@@ -162,7 +177,7 @@ export class SyncServer {
         return;
       }
       const max = this.config.maxConnections;
-      if (max > 0 && this.wss.clients.size >= max) {
+      if (max > 0 && this.sockets >= max) {
         this.drops.add('serverFull');
         reject(socket, 'HTTP/1.1 503 Service Unavailable\r\nRetry-After: 30\r\n\r\n');
         return;
@@ -193,14 +208,17 @@ export class SyncServer {
         }
         const refused = this.ipLimits.connect(ip);
         if (refused) {
-          this.drops.add(`ipLimit(${ip})`);
+          // Ohne IP im Schlüssel: Bei vielen Adressen wüchse die Statistik sonst unbegrenzt.
+          this.drops.add('ipLimit');
           reject(socket, 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\n\r\n');
           return;
         }
       }
       // Ab hier ist die Verbindung pro IP gezählt und muss wieder freigegeben werden.
       let accepted = false;
+      this.sockets++;
       socket.once('close', () => {
+        this.sockets--;
         if (!accepted && ip !== undefined) this.ipLimits.disconnect(ip);
       });
       this.wss.handleUpgrade(req, socket, head, (ws) => {
@@ -251,7 +269,9 @@ export class SyncServer {
     this.expiring ??= (async () => {
       try {
         const before = new Date(Date.now() - this.config.vaultTtlDays * 24 * 60 * 60 * 1000);
-        const n = await this.store.expire(before);
+        // Vaults mit Verbindungen oder offenen Aufgaben bleiben, sonst finge ein
+        // verbundenes Gerät unbemerkt in einer neuen Epoche an.
+        const n = await this.store.expire(before, (id) => this.rooms.has(id.toString('hex')));
         if (n > 0) console.log(`${n} unbenutzte Vaults entfernt.`);
       } catch (e) {
         console.error('Fehler beim Entfernen unbenutzter Vaults:', e);
@@ -325,6 +345,8 @@ export class SyncServer {
       refilledAt: Date.now(),
       ip,
       helloTimer: undefined,
+      queued: 0,
+      queuedBytes: 0,
     };
     if (this.config.helloTimeoutMs > 0) {
       conn.helloTimer = setTimeout(() => {
@@ -384,6 +406,7 @@ export class SyncServer {
   private takeToken(conn: Connection): boolean {
     const now = Date.now();
     const rate = this.config.messagesPerSecond;
+    if (rate === 0) return true;
     conn.tokens = Math.min(rate * 10, conn.tokens + ((now - conn.refilledAt) / 1000) * rate);
     conn.refilledAt = now;
     if (conn.tokens < 1) return false;
@@ -414,22 +437,38 @@ export class SyncServer {
       case Op.push: {
         const room = this.requireRoom(conn);
         const { reqId, records } = msg;
+        const bytes = records.reduce((sum, r) => sum + r.key.length + r.data.length, 0);
+        // Ein einzelner PUSH geht immer, auch wenn er größer als das Byte-Limit ist.
+        if (
+          conn.queued >= MAX_QUEUED_PUSHES ||
+          (conn.queued > 0 && conn.queuedBytes + bytes > MAX_QUEUED_PUSH_BYTES)
+        ) {
+          throw new ProtocolError(ErrorCode.rateLimited, 'Zu viele unbestätigte Änderungen');
+        }
+        conn.queued++;
+        conn.queuedBytes += bytes;
+        // Bei geschlossener Verbindung entfällt die Aufgabe samt Freigabe – egal.
         this.runIn(conn, room, async () => {
-          const first = await this.store.put(room.id, records, {
-            maxRecords: this.config.maxVaultRecords,
-            maxBytes: this.config.maxVaultBytes,
-            maxTotalBytes: this.config.maxTotalBytes,
-          });
-          if (first === null) {
-            this.sendWs(conn.ws, VAULT_DELETED);
-            return;
+          try {
+            const first = await this.store.put(room.id, records, {
+              maxRecords: this.config.maxVaultRecords,
+              maxBytes: this.config.maxVaultBytes,
+              maxTotalBytes: this.config.maxTotalBytes,
+            });
+            if (first === null) {
+              this.sendWs(conn.ws, VAULT_DELETED);
+              return;
+            }
+            const stored: StoredRecord[] = records.map((r, i) => ({ ...r, seq: first + i }));
+            const frame = encodeChanges(stored);
+            for (const other of room.conns) {
+              if (other !== conn && other.live) this.sendWs(other.ws, frame);
+            }
+            this.sendWs(conn.ws, encodeAck(reqId, first));
+          } finally {
+            conn.queued--;
+            conn.queuedBytes -= bytes;
           }
-          const stored: StoredRecord[] = records.map((r, i) => ({ ...r, seq: first + i }));
-          const frame = encodeChanges(stored);
-          for (const other of room.conns) {
-            if (other !== conn && other.live) this.sendWs(other.ws, frame);
-          }
-          this.sendWs(conn.ws, encodeAck(reqId, first));
         });
         return;
       }
@@ -481,8 +520,10 @@ export class SyncServer {
     // läuft außerhalb, sonst hielte ein langsamer Client PUSH/ACK aller
     // anderen Geräte des Vaults auf.
     this.runIn(conn, r, async () => {
-      const head = await this.store.head(r.id);
+      // Erst anlegen, dann lesen: So trägt schon das erste SYNCED die Epoche,
+      // die auch nach dem ersten PUSH noch gilt.
       await this.store.touch(r.id);
+      const head = await this.store.head(r.id);
       if (head.deleted) {
         this.sendWs(conn.ws, VAULT_DELETED);
         conn.ws.close(1000);
@@ -524,7 +565,7 @@ export class SyncServer {
           return;
         }
         if ((await this.sendChanges(conn, room, after, head.seq)) === null) return;
-        this.sendWs(conn.ws, encodeSynced(head.seq));
+        this.sendWs(conn.ws, encodeSynced(head.seq, head.epoch));
         conn.live = true;
       });
     } catch (e) {

@@ -1,3 +1,5 @@
+import { randomInt } from 'node:crypto';
+
 import { ErrorCode, ProtocolError } from './protocol.ts';
 import type { SyncRecord, StoredRecord } from './protocol.ts';
 
@@ -51,21 +53,44 @@ export function applyQuota(
   return next;
 }
 
+/**
+ * Neue Epoche für einen (neu) angelegten Vault: zufällig, 48 Bit, nie 0
+ * (0 = Vault fehlt oder stammt aus der Zeit vor den Epochen).
+ */
+export function newEpoch(): number {
+  return randomInt(1, 2 ** 48);
+}
+
+export interface Head {
+  seq: number;
+  /** Code wurde gelöscht und ist verbrannt. */
+  deleted: boolean;
+  /**
+   * Wechselt, wenn der Vault neu angelegt wird (z. B. nach dem Ablauf).
+   * Sequenznummern sind nur innerhalb einer Epoche vergleichbar.
+   */
+  epoch: number;
+}
+
 /** Speicher für die verschlüsselten Datensätze (MySQL oder im Speicher für Tests). */
 export interface Store {
-  head(vault: Buffer): Promise<{ seq: number; deleted: boolean }>;
+  head(vault: Buffer): Promise<Head>;
   changesSince(vault: Buffer, after: number, limit: number): Promise<StoredRecord[]>;
   /** Erste vergebene Sequenznummer, `null` wenn der Vault gelöscht ist. */
   put(vault: Buffer, records: SyncRecord[], quota: Quota): Promise<number | null>;
   deleteVault(vault: Buffer): Promise<void>;
-  /** Merkt sich, dass ein Gerät den Vault gerade benutzt. */
+  /**
+   * Merkt sich, dass ein Gerät den Vault gerade benutzt, und legt ihn an,
+   * falls er fehlt – damit schon das erste SYNCED die endgültige Epoche trägt.
+   */
   touch(vault: Buffer): Promise<void>;
   /**
    * Entfernt Vaults (auch gelöschte), die seit [before] nicht benutzt wurden,
    * vollständig. Kommt ein Gerät später zurück, lädt es seine Daten neu hoch.
-   * Gibt die Zahl der entfernten Vaults zurück.
+   * Vaults, für die [keep] `true` liefert, bleiben. Gibt die Zahl der
+   * entfernten Vaults zurück.
    */
-  expire(before: Date): Promise<number>;
+  expire(before: Date, keep?: (vault: Buffer) => boolean): Promise<number>;
   ping(): Promise<void>;
   close(): Promise<void>;
 }
@@ -73,6 +98,7 @@ export interface Store {
 interface MemoryVault {
   seq: number;
   deleted: boolean;
+  epoch: number;
   records: Map<string, StoredRecord>;
   activeAt: number;
 }
@@ -85,7 +111,7 @@ export class MemoryStore implements Store {
     const k = id.toString('hex');
     let v = this.vaults.get(k);
     if (!v) {
-      v = { seq: 0, deleted: false, records: new Map(), activeAt: Date.now() };
+      v = { seq: 0, deleted: false, epoch: newEpoch(), records: new Map(), activeAt: Date.now() };
       this.vaults.set(k, v);
     }
     return v;
@@ -93,7 +119,7 @@ export class MemoryStore implements Store {
 
   async head(id: Buffer) {
     const v = this.vaults.get(id.toString('hex'));
-    return { seq: v?.seq ?? 0, deleted: v?.deleted ?? false };
+    return { seq: v?.seq ?? 0, deleted: v?.deleted ?? false, epoch: v?.epoch ?? 0 };
   }
 
   async changesSince(id: Buffer, after: number, limit: number) {
@@ -134,14 +160,13 @@ export class MemoryStore implements Store {
   }
 
   async touch(id: Buffer) {
-    const v = this.vaults.get(id.toString('hex'));
-    if (v) v.activeAt = Date.now();
+    this.vault(id).activeAt = Date.now();
   }
 
-  async expire(before: Date) {
+  async expire(before: Date, keep?: (vault: Buffer) => boolean) {
     let n = 0;
     for (const [k, v] of this.vaults) {
-      if (v.activeAt < before.getTime()) {
+      if (v.activeAt < before.getTime() && !keep?.(Buffer.from(k, 'hex'))) {
         this.vaults.delete(k);
         n++;
       }
