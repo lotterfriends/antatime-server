@@ -52,6 +52,7 @@ DB_HOST=db.example.org DB_USER=antatime DB_PASSWORD=… DB_NAME=antatime \
 | `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` | `localhost`, `3306`, `antatime`, –, `antatime` | |
 | `DATABASE_URL` | – | Alternative: `mysql://user:pass@host:3306/db` |
 | `STORE` | – | `memory` = ohne Datenbank (nur Tests) |
+| `UPDATES_DIR` | – | Verzeichnis mit App-Paketen, die der Server als Updates anbietet – nur nötig, wenn die Apps nicht von GitHub laden sollen (siehe [App-Updates](#app-updates)); ohne Angabe gibt es `/updates/` nicht |
 | `WEB_DIR` | – | Web-App aus diesem Verzeichnis statt der eingebetteten ausliefern; `off` = keine Web-App |
 | `MAX_RECORD_BYTES` | `16384` | Größe eines verschlüsselten Datensatzes |
 | `MAX_RECORDS_PER_PUSH` | `1000` | |
@@ -95,6 +96,30 @@ Der Server liefert den Flutter-Web-Build der App unter `/` aus, `/sync` (WebSock
 - **Caching:** Flutter-Dateien haben keinen Inhalts-Hash im Namen, daher `Cache-Control: no-cache` mit ETag. Beim Neuladen fragt der Browser nach und bekommt ein 304 ohne Inhalt, solange sich nichts geändert hat.
 - **Sync-Vorschlag:** Der Server ergänzt die `index.html` um `<meta name="antatime-sync-url" content="same-origin">`. Die App trägt dadurch im Sync-Dialog diesen Server (inkl. Unterpfad aus `<base href>`) als Adresse vor. Eine anderswo gehostete Web-App (z. B. GitHub Pages) hat die Markierung nicht.
 - **Unterpfad** hinter einem Reverse-Proxy (z. B. `/antatime/`): Die App mit `flutter build web --base-href /antatime/` bauen, der Proxy entfernt den Präfix.
+
+## App-Updates
+
+Die Android-App (als APK installiert) und die Desktop-Apps holen ihre Updates normalerweise direkt aus den GitHub-Releases der App – dafür braucht dieser Server nichts zu tun. Er kann die Pakete aber auch selbst anbieten, etwa wenn das Repository privat ist: Die App mit `UPDATE_URL=<dieser Server>` bauen, `UPDATES_DIR` auf ein Verzeichnis zeigen lassen und die Pakete aus `antatime-app/dist/` hineinkopieren – unter den Namen, die die Build-Skripte vergeben:
+
+```
+antatime-1.6.0.apk
+AnTaTime-1.6.0-x86_64.AppImage
+antatime_1.6.0_amd64.deb
+antatime-1.6.0-linux-x64.tar.gz
+AnTaTime-1.6.0-windows-x64-setup.exe
+antatime-1.6.0-windows-x64.zip
+AnTaTime-1.6.0-macos.dmg
+```
+
+```bash
+rsync -av ../antatime-app/dist/*-1.6.0* ../antatime-app/dist/*_1.6.0_* server:/pfad/zu/updates/
+```
+
+- `GET /updates/latest.json` nennt je Paketart (und Architektur) die **höchste Version** im Verzeichnis, mit Größe und SHA-256. Ältere Pakete dürfen liegen bleiben. Die Prüfsumme wird je Datei einmal berechnet; das Verzeichnis wird höchstens alle 10 s neu gelesen, ein Neustart ist nicht nötig.
+- `GET /updates/<datei>` liefert ein Paket. Abrufbar sind nur Dateien mit einem der Namen oben, nichts anderes aus dem Verzeichnis.
+- Neue Pakete zuerst unter einem anderen Namen hochladen und dann umbenennen (rsync macht das von selbst) – sonst könnte eine App eine halbe Datei angeboten bekommen. Sie würde sie an der Prüfsumme erkennen und verwerfen.
+- Die Apps fragen nur den Server, der bei ihrem Build mit `UPDATE_URL` festgelegt wurde (siehe README der App), und nur über HTTPS. Android installiert außerdem nur APKs, die mit demselben Schlüssel signiert sind wie die installierte App. Für Linux, Windows und macOS gibt es keine solche Signatur: Wer Pakete in dieses Verzeichnis legen kann, kann Code auf den Rechnern der Benutzer ausführen – Schreibrechte entsprechend knapp halten.
+- Docker: das Verzeichnis als Volume einhängen, z. B. `-v /srv/antatime-updates:/updates:ro -e UPDATES_DIR=/updates`.
 
 ## Sicherheit
 

@@ -4,6 +4,7 @@ import { installFileLog } from './log.ts';
 import { MemoryStore } from './store.ts';
 import type { Store } from './store.ts';
 import { SyncServer } from './sync-server.ts';
+import { Updates } from './updates.ts';
 import { DirectoryWebApp, EmbeddedWebApp } from './web-app.ts';
 import type { WebApp } from './web-app.ts';
 import embeddedWeb from './web-embedded.ts';
@@ -39,10 +40,13 @@ async function main(): Promise<void> {
     web = new EmbeddedWebApp(embeddedWeb);
   }
 
-  const server = new SyncServer(config, store, web);
+  const updates = config.updatesDir ? new Updates(config.updatesDir) : null;
+
+  const server = new SyncServer(config, store, web, updates);
   const port = await server.listen();
   console.log(`AnTaTime-Sync läuft auf ${config.host}:${port} (WebSocket /sync, Status /health)`);
   console.log(web ? `Web-App unter / (${web.source})` : 'Keine Web-App (WEB_DIR nicht gesetzt)');
+  if (updates) console.log(`App-Updates unter /updates/ (${updates.dir})`);
 
   let stopping = false;
   const stop = async (signal: string) => {

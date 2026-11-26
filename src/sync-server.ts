@@ -22,6 +22,8 @@ import {
 } from './protocol.ts';
 import type { ClientMessage, StoredRecord } from './protocol.ts';
 import type { Store } from './store.ts';
+import { serveUpdates } from './updates.ts';
+import type { Updates } from './updates.ts';
 import { serveWebApp } from './web-app.ts';
 import type { WebApp } from './web-app.ts';
 
@@ -140,6 +142,7 @@ export class SyncServer {
   private readonly store: Store;
 
   private readonly web: WebApp | null;
+  private readonly updates: Updates | null;
   private readonly ipLimits: IpLimiter;
   private readonly trustedProxies: TrustedProxies;
   private health: { at: number; ok: Promise<boolean> } | null = null;
@@ -154,10 +157,16 @@ export class SyncServer {
   private warnedUntrusted = false;
   readonly drops = new DropStats();
 
-  constructor(config: Config, store: Store, web: WebApp | null = null) {
+  constructor(
+    config: Config,
+    store: Store,
+    web: WebApp | null = null,
+    updates: Updates | null = null,
+  ) {
     this.config = config;
     this.store = store;
     this.web = web;
+    this.updates = updates;
     this.ipLimits = new IpLimiter(config);
     this.trustedProxies = new TrustedProxies(config.trustedProxies);
     this.http = createServer((req, res) => void this.handleHttp(req, res));
@@ -293,9 +302,10 @@ export class SyncServer {
       return;
     }
     try {
+      if (this.updates && (await serveUpdates(this.updates, req, res))) return;
       if (this.web && (await serveWebApp(this.web, req, res))) return;
     } catch (e) {
-      console.error('Fehler beim Ausliefern der Web-App:', e);
+      console.error('Fehler beim Ausliefern von Web-App oder Updates:', e);
       if (!res.headersSent) send(res, 500, { status: 'error' });
       else res.destroy();
       return;

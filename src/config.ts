@@ -15,6 +15,8 @@ export interface Config {
   db: DbConfig;
   /** Verzeichnis eines Flutter-Web-Builds; leer = eingebetteter Build, `off` = keine Web-App. */
   webDir: string;
+  /** Verzeichnis mit App-Paketen für `/updates/…`; leer = keine Updates. */
+  updatesDir: string;
   /** Maximale Größe eines verschlüsselten Datensatzes in Bytes. */
   maxRecordBytes: number;
   maxRecordsPerPush: number;
@@ -93,6 +95,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     port: int(env, 'PORT', 8080),
     db,
     webDir: env['WEB_DIR'] ?? '',
+    updatesDir: (env['UPDATES_DIR'] ?? '').trim(),
     maxRecordBytes: int(env, 'MAX_RECORD_BYTES', 16 * 1024),
     maxRecordsPerPush: int(env, 'MAX_RECORDS_PER_PUSH', 1000),
     maxMessageBytes: int(env, 'MAX_MESSAGE_BYTES', 4 * 1024 * 1024),
