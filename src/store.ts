@@ -11,6 +11,15 @@ export interface Quota {
   maxBytes: number;
   /** über alle Vaults des Servers */
   maxTotalBytes: number;
+  /** Höchstzahl an Vaults mit Daten auf dem Server */
+  maxVaults: number;
+}
+
+export const SERVER_FULL_MESSAGE =
+  'Dieser Server hat die maximale Anzahl an Nutzern erreicht und nimmt keine neuen Sync-Codes an';
+
+export function serverFull(): ProtocolError {
+  return new ProtocolError(ErrorCode.serverFull, SERVER_FULL_MESSAGE);
 }
 
 export interface Usage {
@@ -76,7 +85,11 @@ export interface Head {
 export interface Store {
   head(vault: Buffer): Promise<Head>;
   changesSince(vault: Buffer, after: number, limit: number): Promise<StoredRecord[]>;
-  /** Erste vergebene Sequenznummer, `null` wenn der Vault gelöscht ist. */
+  /**
+   * Erste vergebene Sequenznummer, `null` wenn der Vault gelöscht ist. Wirft
+   * `serverFull`, wenn es die ersten Daten des Vaults wären und der Server
+   * bereits `quota.maxVaults` Vaults mit Daten hat.
+   */
   put(vault: Buffer, records: SyncRecord[], quota: Quota): Promise<number | null>;
   deleteVault(vault: Buffer): Promise<void>;
   /**
@@ -84,6 +97,12 @@ export interface Store {
    * falls er fehlt – damit schon das erste SYNCED die endgültige Epoche trägt.
    */
   touch(vault: Buffer): Promise<void>;
+  /**
+   * Zahl der belegten Plätze für `MAX_VAULTS`: Vaults mit Daten, die nicht
+   * gelöscht sind. Leere Vaults (nur verbunden, nie etwas hochgeladen)
+   * zählen nicht – sonst ließe sich der Server mit bloßen Verbindungen füllen.
+   */
+  vaultCount(): Promise<number>;
   /**
    * Entfernt Vaults (auch gelöschte), die seit [before] nicht benutzt wurden,
    * vollständig. Kommt ein Gerät später zurück, lädt es seine Daten neu hoch.
@@ -134,6 +153,7 @@ export class MemoryStore implements Store {
   async put(id: Buffer, records: SyncRecord[], quota: Quota) {
     const v = this.vault(id);
     if (v.deleted) return null;
+    if (quota.maxVaults > 0 && v.seq === 0 && (await this.vaultCount()) >= quota.maxVaults) throw serverFull();
     const existing = new Map<string, number>();
     let bytes = 0;
     for (const [k, r] of v.records) {
@@ -161,6 +181,12 @@ export class MemoryStore implements Store {
 
   async touch(id: Buffer) {
     this.vault(id).activeAt = Date.now();
+  }
+
+  async vaultCount() {
+    let n = 0;
+    for (const v of this.vaults.values()) if (v.seq > 0 && !v.deleted) n++;
+    return n;
   }
 
   async expire(before: Date, keep?: (vault: Buffer) => boolean) {

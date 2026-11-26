@@ -1,3 +1,4 @@
+import { generateServerKey } from './auth.ts';
 import { loadConfig } from './config.ts';
 import { Database } from './db.ts';
 import { installFileLog } from './log.ts';
@@ -10,14 +11,31 @@ import type { WebApp } from './web-app.ts';
 import embeddedWeb from './web-embedded.ts';
 
 // Zuerst, damit auch Fehler in der Konfiguration in der Datei landen.
+// Nicht bei `keygen`: Der private Schlüssel gehört nicht in die Logdatei.
+const isKeygen = process.argv[2] === 'keygen';
 const logFile = process.env['LOG_FILE']?.trim();
-if (logFile) {
+if (logFile && !isKeygen) {
   const raw = process.env['LOG_FILE_MAX_BYTES']?.trim();
   const max = raw ? Number(raw) : NaN;
   installFileLog(logFile, Number.isInteger(max) && max >= 0 ? max : undefined);
 }
 
+/** `antatime-server keygen`: Schlüsselpaar für die optionale Anmeldung. */
+function keygen(): void {
+  const { privateKey, publicKey } = generateServerKey();
+  console.log(
+    [
+      'Privater Schlüssel – nur für den Server, als Umgebungsvariable setzen:',
+      `  SERVER_PRIVATE_KEY=${privateKey}`,
+      '',
+      'Server-Schlüssel – an die Nutzer weitergeben (in App und Widget eintragen):',
+      `  ${publicKey}`,
+    ].join('\n'),
+  );
+}
+
 async function main(): Promise<void> {
+  if (isKeygen) return keygen();
   const config = loadConfig();
   let store: Store;
   if (process.env['STORE'] === 'memory') {
@@ -47,6 +65,12 @@ async function main(): Promise<void> {
   console.log(`AnTaTime-Sync läuft auf ${config.host}:${port} (WebSocket /sync, Status /health)`);
   console.log(web ? `Web-App unter / (${web.source})` : 'Keine Web-App (WEB_DIR nicht gesetzt)');
   if (updates) console.log(`App-Updates unter /updates/ (${updates.dir})`);
+  if (server.auth) {
+    console.log(`Anmeldung aktiv (SERVER_PRIVATE_KEY). Server-Schlüssel für App und Widget: ${server.auth.publicKey}`);
+  }
+  if (config.maxVaults > 0) {
+    console.log(`Höchstens ${config.maxVaults} Nutzer (MAX_VAULTS), belegt: ${await store.vaultCount()}`);
+  }
 
   let stopping = false;
   const stop = async (signal: string) => {

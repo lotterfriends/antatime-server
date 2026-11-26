@@ -3,7 +3,7 @@ import type { Pool, RowDataPacket } from 'mysql2/promise';
 
 import type { DbConfig } from './config.ts';
 import type { SyncRecord, StoredRecord } from './protocol.ts';
-import { applyQuota, newEpoch } from './store.ts';
+import { applyQuota, newEpoch, serverFull } from './store.ts';
 import type { Head, Quota, Store } from './store.ts';
 
 const SCHEMA = [
@@ -31,6 +31,8 @@ const SCHEMA = [
    ) ENGINE=InnoDB`,
 ];
 
+const COUNT_VAULTS = 'SELECT COUNT(*) AS n FROM vaults WHERE seq > 0 AND deleted = FALSE';
+
 /** So lange gilt die zwischengespeicherte Gesamtbelegung des Servers. */
 const TOTAL_TTL_MS = 10_000;
 /** Vaults pro Lösch-Durchgang beim Ablauf. */
@@ -46,6 +48,11 @@ export class Database implements Store {
    * Pushes in verschiedene Vaults das Gesamt-Kontingent gemeinsam überschreiten.
    */
   private reserved = 0;
+  /**
+   * Erste Pushes neuer Vaults laufen nacheinander, damit gleichzeitige das
+   * Limit `maxVaults` nicht gemeinsam überschreiten.
+   */
+  private firstPush: Promise<void> = Promise.resolve();
 
   constructor(config: DbConfig) {
     this.pool = mysql.createPool({
@@ -155,7 +162,13 @@ export class Database implements Store {
     const n = records.length;
     let reserve = 0;
     let conn;
+    let unlock: (() => void) | undefined;
     try {
+      if (quota.maxVaults > 0 && (await this.head(vault)).seq === 0) {
+        const prev = this.firstPush;
+        this.firstPush = new Promise((resolve) => (unlock = resolve));
+        await prev;
+      }
       const fetchedTotal = quota.maxTotalBytes > 0 ? await this.totalBytes() : 0;
       conn = await this.pool.getConnection();
       await conn.beginTransaction();
@@ -168,6 +181,11 @@ export class Database implements Store {
       if (head['deleted']) {
         await conn.rollback();
         return null;
+      }
+      if (quota.maxVaults > 0 && Number(head['seq']) === 0) {
+        // Erst hier gelesen: Der vorige erste Push ist dann schon verbucht.
+        const [cnt] = await conn.query<RowDataPacket[]>(COUNT_VAULTS);
+        if (Number(cnt[0]!['n']) >= quota.maxVaults) throw serverFull();
       }
       const [old] = await conn.query<RowDataPacket[]>(
         'SELECT rkey, LENGTH(data) AS len FROM records WHERE vault = ? AND rkey IN (?)',
@@ -208,6 +226,7 @@ export class Database implements Store {
     } finally {
       this.reserved -= reserve;
       conn?.release();
+      unlock?.();
     }
   }
 
@@ -243,6 +262,11 @@ export class Database implements Store {
         'ON DUPLICATE KEY UPDATE active_at = IF(active_at < NOW() - INTERVAL 1 HOUR, NOW(), active_at)',
       [vault, newEpoch()],
     );
+  }
+
+  async vaultCount(): Promise<number> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(COUNT_VAULTS);
+    return Number(rows[0]!['n']);
   }
 
   async expire(before: Date, keep?: (vault: Buffer) => boolean): Promise<number> {

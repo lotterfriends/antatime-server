@@ -13,6 +13,7 @@
   "scripts": {
     "dev": "node --watch --env-file-if-exists=.env src/main.ts",
     "start": "node dist/antatime-server.cjs",
+    "keygen": "node src/main.ts keygen",
     "build": "node build.mjs",
     "typecheck": "tsc",
     "test": "node --test test/*.test.ts"

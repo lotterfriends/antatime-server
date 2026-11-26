@@ -9,6 +9,7 @@
  *   0x02 PUSH          varint reqId, varint n, n × { key, varint len, data }
  *   0x03 DELETE_VAULT
  *   0x04 PING
+ *   0x05 AUTH          ephPub[32], mac[32] – Antwort auf CHALLENGE (siehe auth.ts)
  *
  * Server → Client
  *   0x81 CHANGES       varint n, n × { varint seq, key, varint len, data }
@@ -24,6 +25,11 @@
  *   0x83 ACK           varint reqId, varint firstSeq (Seqs firstSeq … firstSeq+n−1)
  *   0x84 PONG
  *   0x85 VAULT_DELETED
+ *   0x86 CHALLENGE     nonce[32] – nur mit SERVER_PRIVATE_KEY, gleich nach dem
+ *                      Verbindungsaufbau. Vor HELLO muss der Client dann AUTH
+ *                      senden; PING ist auch ohne Anmeldung erlaubt.
+ *   0x87 AUTH_OK       proof[32] – Anmeldung angenommen; der Nachweis zeigt
+ *                      dem Client, dass der Server den privaten Schlüssel hat.
  *   0x8F ERROR         u8 code, UTF-8-Text
  *
  * Der Server kennt weder den Sync-Code noch die Schlüssel: `vault` und `key`
@@ -39,11 +45,14 @@ export const Op = {
   push: 0x02,
   deleteVault: 0x03,
   ping: 0x04,
+  auth: 0x05,
   changes: 0x81,
   synced: 0x82,
   ack: 0x83,
   pong: 0x84,
   vaultDeleted: 0x85,
+  challenge: 0x86,
+  authOk: 0x87,
   error: 0x8f,
 } as const;
 
@@ -55,6 +64,12 @@ export const ErrorCode = {
   tooManyConnections: 5,
   internal: 6,
   quotaExceeded: 7,
+  /** Der Server verlangt eine Anmeldung mit dem Server-Schlüssel. */
+  authRequired: 8,
+  /** Anmeldung abgelehnt: falscher Server-Schlüssel. */
+  authFailed: 9,
+  /** `MAX_VAULTS` erreicht: Der Server nimmt keine neuen Sync-Codes an. */
+  serverFull: 10,
 } as const;
 
 export class ProtocolError extends Error {
@@ -78,7 +93,8 @@ export type ClientMessage =
   | { op: typeof Op.hello; version: number; vault: Buffer; lastSeq: number }
   | { op: typeof Op.push; reqId: number; records: SyncRecord[] }
   | { op: typeof Op.deleteVault }
-  | { op: typeof Op.ping };
+  | { op: typeof Op.ping }
+  | { op: typeof Op.auth; ephPub: Buffer; mac: Buffer };
 
 // ---------------------------------------------------------------------------
 // Lesen
@@ -166,6 +182,9 @@ export function decodeClientMessage(buf: Buffer, limits: Limits): ClientMessage 
     case Op.ping:
       msg = { op };
       break;
+    case Op.auth:
+      msg = { op, ephPub: Buffer.from(r.bytes(32)), mac: Buffer.from(r.bytes(32)) };
+      break;
     default:
       throw bad(`Unbekannter Opcode ${op}`);
   }
@@ -245,6 +264,14 @@ export function encodeAck(reqId: number, firstSeq: number): Buffer {
 export const PONG = Buffer.from([Op.pong]);
 export const VAULT_DELETED = Buffer.from([Op.vaultDeleted]);
 
+export function encodeChallenge(nonce: Uint8Array): Buffer {
+  return Buffer.concat([Buffer.from([Op.challenge]), nonce]);
+}
+
+export function encodeAuthOk(proof: Uint8Array): Buffer {
+  return Buffer.concat([Buffer.from([Op.authOk]), proof]);
+}
+
 export function encodeError(code: number, message: string): Buffer {
   return Buffer.concat([Buffer.from([Op.error, code]), Buffer.from(message, 'utf8')]);
 }
@@ -259,4 +286,8 @@ export function encodePush(reqId: number, records: SyncRecord[]): Buffer {
   const w = new Writer().u8(Op.push).varint(reqId).varint(records.length);
   for (const rec of records) w.bytes(rec.key).varint(rec.data.length).bytes(rec.data);
   return w.finish();
+}
+
+export function encodeAuth(ephPub: Uint8Array, mac: Uint8Array): Buffer {
+  return Buffer.concat([Buffer.from([Op.auth]), ephPub, mac]);
 }

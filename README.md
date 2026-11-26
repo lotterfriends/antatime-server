@@ -36,6 +36,7 @@ STORE=memory npm run dev         # ganz ohne Datenbank (Daten nur im RAM)
 | `npm test` | Protokoll- und Server-Tests (In-Memory) |
 | `TEST_DATABASE_URL=mysql://antatime:antatime@127.0.0.1:3306/antatime npm test` | zusätzlich gegen MySQL |
 | `npm run typecheck` | TypeScript-Prüfung |
+| `npm run keygen` | erzeugt ein Schlüsselpaar für `SERVER_PRIVATE_KEY` (im Bundle: `node antatime-server.cjs keygen`) |
 
 ## Betrieb
 
@@ -65,6 +66,8 @@ DB_HOST=db.example.org DB_USER=antatime DB_PASSWORD=… DB_NAME=antatime \
 | `UPLOAD_BYTES_PER_IP_PER_MINUTE` | `10485760` | hochgeladene Bytes pro IP und Minute (10 MB) |
 | `MAX_VAULT_RECORDS` / `MAX_VAULT_BYTES` | `100000` / `67108864` | Speicher-Kontingent pro Sync-Code (64 MB) |
 | `MAX_TOTAL_BYTES` | `10737418240` | Speicher aller Sync-Codes zusammen (10 GB); danach nimmt der Server nur noch Änderungen an, die nichts vergrößern. Weiches Limit: Die Gesamtbelegung wird nur alle 10 s aus der Datenbank gelesen und dazwischen im Prozess fortgeschrieben (gleichzeitige Pushes eingerechnet); Schreiben andere Prozesse in dieselbe Datenbank, kann es um deren Zuwachs überschritten werden |
+| `MAX_VAULTS` | `0` | Höchstzahl an Nutzern (Sync-Codes mit Daten), `0` = unbegrenzt; siehe [Zugang beschränken](#zugang-beschränken) |
+| `SERVER_PRIVATE_KEY` | – | privater Schlüssel des Servers; ist er gesetzt, kommen nur Apps herein, die den zugehörigen Server-Schlüssel kennen; siehe [Zugang beschränken](#zugang-beschränken) |
 | `VAULT_TTL_DAYS` | `365` | Sync-Codes, die so lange kein Gerät benutzt hat, werden entfernt (auch gelöschte, nie solche mit verbundenem Gerät); kehrt ein Gerät zurück, erkennt es an der neuen Epoche in `SYNCED`, dass der Vault neu angelegt wurde, und lädt seine Daten neu hoch. `0` = nie |
 | `HELLO_TIMEOUT_MS` | `10000` | Verbindungen ohne HELLO werden danach getrennt |
 | `MAX_SEND_BUFFER_BYTES` | `4194304` | Ungelesene Sendedaten pro Verbindung (4 MB); darüber wird getrennt |
@@ -74,7 +77,7 @@ DB_HOST=db.example.org DB_USER=antatime DB_PASSWORD=… DB_NAME=antatime \
 | `CLIENT_IP_HEADER` | – | hinter einem Proxy: Header mit der Client-IP, z. B. `x-forwarded-for` (letzter Eintrag zählt) oder `cf-connecting-ip` |
 | `TRUSTED_PROXIES` | Loopback und private Netze | kommagetrennte IPs/CIDR-Netze (IPv4 und IPv6), deren `CLIENT_IP_HEADER` geglaubt wird; bei allen anderen zählt die Socket-Adresse, damit niemand am Proxy vorbei eine fremde IP vorgeben kann. Standard: `127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7` (passt für Proxy auf demselben Rechner oder im Docker-Netz). Steht der Proxy unter einer öffentlichen Adresse, diese eintragen. Verbindungen ohne Socket-Adresse (Unix-Socket, z. B. Passenger) gelten als vertrauenswürdig |
 
-Limits mit dem Wert `0` sind abgeschaltet. Außerdem nimmt der Server pro Verbindung höchstens 8 unbestätigte PUSHes bzw. 16 MB an. Überschreitungen beantwortet der Server beim Verbindungsaufbau mit HTTP 429 und sonst mit `ERROR` (`4` = zu viel, `7` = Kontingent voll), danach trennt er die Verbindung. Die App verbindet sich mit Backoff neu. Ist die Client-IP nicht bekannt, warnt der Server einmal im Log, und die Limits pro IP greifen nicht.
+Limits mit dem Wert `0` sind abgeschaltet. Außerdem nimmt der Server pro Verbindung höchstens 8 unbestätigte PUSHes bzw. 16 MB an. Überschreitungen beantwortet der Server beim Verbindungsaufbau mit HTTP 429 und sonst mit `ERROR` (`4` = zu viel, `7` = Kontingent voll, `8`/`9` = Server-Schlüssel fehlt/falsch, `10` = Server voll), danach trennt er die Verbindung. Die App verbindet sich mit Backoff neu. Ist die Client-IP nicht bekannt, warnt der Server einmal im Log, und die Limits pro IP greifen nicht.
 
 **TLS:** Der Server spricht selbst nur HTTP/`ws://`. Öffentlich gehört ein Reverse-Proxy mit TLS davor (Caddy, nginx, Traefik), der WebSocket-Upgrades auf `/sync` durchreicht. Die Inhalte sind zwar ohnehin verschlüsselt, TLS schützt aber die Metadaten (Vault-ID, Zeitpunkte, Größen). Eine per HTTPS ausgelieferte Web-App kann außerdem nur `wss://` verwenden.
 
@@ -86,6 +89,38 @@ Der Server ist für **eine Instanz** ausgelegt: Die Reihenfolge-Garantie (siehe 
 - `CLIENT_IP_HEADER=!~passenger-client-address` – Passenger setzt diesen internen Header selbst aus der Adresse, die nginx sieht; Clients können ihn nicht vorgeben. Eigene nginx-Anweisungen sind dafür nicht nötig.
 
 Danach die App neu starten. Fehlt die Client-IP, nennt die Warnung im Log die empfangenen Header. Passenger startet die App gelegentlich neu (beim Neuladen von nginx durch Plesk); die Apps verbinden sich dann nach wenigen Sekunden von selbst wieder.
+
+## Zugang beschränken
+
+Ohne weitere Einstellung kann jeder, der die Adresse kennt, den Server für seine eigenen Daten benutzen (lesen kann er fremde Daten nie, dafür braucht es den Sync-Code). Zwei unabhängige, optionale Einstellungen schränken das ein:
+
+### Server-Schlüssel (`SERVER_PRIVATE_KEY`)
+
+```bash
+npm run keygen                    # oder: node antatime-server.cjs keygen
+```
+
+gibt ein Schlüsselpaar aus (X25519, je 52 Zeichen):
+
+- Den **privaten Schlüssel** als `SERVER_PRIVATE_KEY` setzen. Er bleibt auf dem Server.
+- Den **Server-Schlüssel** (öffentlich) an die Nutzer weitergeben. Der Server schreibt ihn beim Start auch ins Log.
+
+Nutzer tragen den Server-Schlüssel beim Einrichten der Synchronisation ein (Feld „Server-Schlüssel“) oder später unter *Einstellungen → Synchronisation → Server-Schlüssel*; das Widget fragt in `antatime-widget setup` danach bzw. übernimmt ihn von der Desktop-App. Der Schlüssel gilt pro Gerät und wird nicht synchronisiert.
+
+- Ohne oder mit falschem Schlüssel weist der Server das `HELLO` ab (`ERROR 8` bzw. `9`). App und Widget zeigen dafür eine eigene Meldung („Server-Schlüssel erforderlich“ / „… ist falsch“) und versuchen es nur noch alle fünf Minuten – oder sofort, sobald der Schlüssel geändert wird.
+- Der Schlüssel wird bei der Anmeldung nicht übertragen und lässt sich nicht mitlesen. Umgekehrt weist sich der Server gegenüber der App aus: Wer den Server-Schlüssel kennt, kann sich anmelden, aber keinen falschen Server vortäuschen.
+- Web-App, `/health` und `/updates/` bleiben offen; geschützt ist die Synchronisation (`/sync`).
+- Schlüssel wechseln: neues Paar erzeugen, `SERVER_PRIVATE_KEY` ersetzen, Server neu starten, neuen Server-Schlüssel verteilen. Schlüssel abschalten: Variable entfernen – Apps, in denen noch ein Schlüssel eingetragen ist, melden dann „Server verwendet keinen Schlüssel“, bis er dort entfernt wird.
+- Ältere App-Versionen (bis 1.6.0) kennen die Anmeldung nicht und kommen an einem Server mit Schlüssel nicht mehr herein (sie zeigen die Fehlermeldung des Servers).
+
+### Höchstzahl an Nutzern (`MAX_VAULTS`)
+
+Jeder Sync-Code ist ein Vault, also ein Nutzer mit beliebig vielen Geräten. `MAX_VAULTS=50` lässt höchstens 50 Vaults **mit Daten** zu:
+
+- Ist der Server voll, weist er neue Sync-Codes schon beim Verbinden ab (`ERROR 10`). Die App meldet das bereits im Einrichten-Dialog („Server ist voll“), sonst in den Einstellungen; das Widget im Hinweistext. Die Daten bleiben auf dem Gerät.
+- Bestehende Nutzer merken nichts: Sie synchronisieren weiter und können weitere Geräte mit ihrem Code verbinden.
+- Ein Platz wird frei, wenn ein Nutzer „Synchronisation beenden → auch auf dem Server löschen“ wählt oder sein Vault abläuft (`VAULT_TTL_DAYS`).
+- Leere Vaults (verbunden, aber nie etwas hochgeladen) und gelöschte zählen nicht. Die Zahl der belegten Plätze steht beim Start im Log.
 
 ## Web-App
 
@@ -145,11 +180,14 @@ WebSocket `/sync`, nur Binär-Frames. Erstes Byte = Opcode, Zahlen als LEB128-Va
 | C→S | `0x02` PUSH | `varint reqId, varint n, n × (key, varint len, data)` |
 | C→S | `0x03` DELETE_VAULT | – |
 | C→S | `0x04` PING | – |
+| C→S | `0x05` AUTH | `ephPub[32], mac[32]` – Antwort auf CHALLENGE |
 | S→C | `0x81` CHANGES | `varint n, n × (varint seq, key, varint len, data)` |
 | S→C | `0x82` SYNCED | `varint headSeq, varint serverTime, varint epoch` – Nachholen abgeschlossen; `serverTime` = Serveruhr in ms seit 1970, `epoch` = Generation des Vaults (siehe unten). Ältere Server senden nur `headSeq` bzw. `headSeq, serverTime` |
 | S→C | `0x83` ACK | `varint reqId, varint firstSeq` – Seqs `firstSeq … firstSeq+n−1` |
 | S→C | `0x84` PONG | – |
 | S→C | `0x85` VAULT_DELETED | – |
+| S→C | `0x86` CHALLENGE | `nonce[32]` – nur mit `SERVER_PRIVATE_KEY`, gleich nach dem Verbindungsaufbau |
+| S→C | `0x87` AUTH_OK | `proof[32]` – Anmeldung angenommen |
 | S→C | `0x8F` ERROR | `u8 code, UTF-8-Text` |
 
 Ablauf:
@@ -159,6 +197,16 @@ Ablauf:
 3. Danach: `PUSH` → Server vergibt fortlaufende Nummern, verteilt `CHANGES` sofort an die anderen Geräte des Vaults und bestätigt mit `ACK`.
 
 **Epoche:** Läuft ein Vault ab und wird später neu angelegt, beginnen die Sequenznummern wieder bei 1. Damit ein Gerät mit altem `lastSeq` dabei nichts verpasst, trägt jeder Vault eine zufällige Epoche (48 Bit, nie 0), die sich nur beim Neuanlegen ändert; Vaults aus der Zeit vor den Epochen haben `0`. Der Server legt den Vault schon beim `HELLO` an, sodass bereits das erste `SYNCED` die gültige Epoche trägt. Weicht sie von der gemerkten ab, verwirft der Client `lastSeq`, holt ab `0` nach und lädt seine Daten neu hoch.
+
+**Anmeldung** (nur mit `SERVER_PRIVATE_KEY`): Der Server sendet nach dem Verbindungsaufbau `CHALLENGE`. Der Client erzeugt ein einmaliges X25519-Schlüsselpaar und antwortet mit `AUTH`; erst nach `AUTH_OK` sendet er `HELLO`. Mit `S` = öffentlicher Server-Schlüssel:
+
+```
+k     = HKDF-SHA256(X25519(eph, S), salt = "antatime-auth-v1", info = nonce ‖ ephPub ‖ S)
+mac   = HMAC-SHA256(k, "client" ‖ nonce)        → AUTH
+proof = HMAC-SHA256(k, "server" ‖ nonce)        → AUTH_OK
+```
+
+Ein Client mit eingetragenem Schlüssel sendet zuerst ein `PING` (auch ohne Anmeldung erlaubt): Kommt `PONG` vor einer `CHALLENGE`, verwendet der Server keinen Schlüssel. Schlüssel als Text: Crockford-Base32 wie der Sync-Code, 52 Zeichen für 32 Byte.
 
 Alle Aufgaben eines Vaults laufen auf dem Server strikt nacheinander. Daher gilt pro Verbindung: Fremde Änderungen kommen in Reihenfolge an, und vor einem `ACK` sind alle kleineren Nummern bereits zugestellt. Der Client kann seinen Stand also ohne Lücken auf `firstSeq+n−1` setzen und lädt eigene Änderungen nie erneut herunter.
 

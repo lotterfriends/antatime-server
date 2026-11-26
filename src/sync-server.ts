@@ -5,6 +5,7 @@ import type { Duplex } from 'node:stream';
 import { WebSocketServer } from 'ws';
 import type { RawData, WebSocket } from 'ws';
 
+import { ServerAuth } from './auth.ts';
 import type { Config } from './config.ts';
 import { IpLimiter, TrustedProxies, clientIp } from './limits.ts';
 import {
@@ -16,11 +17,14 @@ import {
   VAULT_DELETED,
   decodeClientMessage,
   encodeAck,
+  encodeAuthOk,
+  encodeChallenge,
   encodeChanges,
   encodeError,
   encodeSynced,
 } from './protocol.ts';
 import type { ClientMessage, StoredRecord } from './protocol.ts';
+import { serverFull } from './store.ts';
 import type { Store } from './store.ts';
 import { serveUpdates } from './updates.ts';
 import type { Updates } from './updates.ts';
@@ -129,6 +133,8 @@ interface Connection {
   /** PUSHes in der Warteschlange des Vaults (laufend oder wartend) und ihre Größe. */
   queued: number;
   queuedBytes: number;
+  /** Offene CHALLENGE; `null` = angemeldet (oder keine Anmeldung nötig). */
+  challenge: Buffer | null;
 }
 
 export class SyncServer {
@@ -145,6 +151,8 @@ export class SyncServer {
   private readonly updates: Updates | null;
   private readonly ipLimits: IpLimiter;
   private readonly trustedProxies: TrustedProxies;
+  /** Anmeldung mit Server-Schlüssel; `null` = Server ist offen. */
+  readonly auth: ServerAuth | null;
   private health: { at: number; ok: Promise<boolean> } | null = null;
   /** Laufendes Nachholen außerhalb der Warteschlangen; `close()` wartet darauf. */
   private readonly catchUps = new Set<Promise<void>>();
@@ -169,6 +177,7 @@ export class SyncServer {
     this.updates = updates;
     this.ipLimits = new IpLimiter(config);
     this.trustedProxies = new TrustedProxies(config.trustedProxies);
+    this.auth = config.serverPrivateKey ? new ServerAuth(config.serverPrivateKey) : null;
     this.http = createServer((req, res) => void this.handleHttp(req, res));
     this.wss = new WebSocketServer({
       noServer: true,
@@ -357,6 +366,7 @@ export class SyncServer {
       helloTimer: undefined,
       queued: 0,
       queuedBytes: 0,
+      challenge: this.auth?.challenge() ?? null,
     };
     if (this.config.helloTimeoutMs > 0) {
       conn.helloTimer = setTimeout(() => {
@@ -368,6 +378,7 @@ export class SyncServer {
       conn.helloTimer.unref();
     }
     connOf.set(ws, conn);
+    if (conn.challenge) this.sendWs(ws, encodeChallenge(conn.challenge));
     ws.on('pong', () => (conn.alive = true));
     ws.on('message', (data, isBinary) => this.onMessage(conn, data, isBinary));
     ws.on('close', () => {
@@ -441,6 +452,15 @@ export class SyncServer {
       case Op.ping:
         this.sendWs(conn.ws, PONG);
         return;
+      case Op.auth: {
+        const nonce = conn.challenge;
+        if (!this.auth || !nonce) throw new ProtocolError(ErrorCode.badRequest, 'Keine Anmeldung offen');
+        const proof = this.auth.verify(nonce, msg.ephPub, msg.mac);
+        if (!proof) throw new ProtocolError(ErrorCode.authFailed, 'Der Server-Schlüssel ist falsch');
+        conn.challenge = null;
+        this.sendWs(conn.ws, encodeAuthOk(proof));
+        return;
+      }
       case Op.hello:
         this.hello(conn, msg.version, msg.vault, msg.lastSeq);
         return;
@@ -464,6 +484,7 @@ export class SyncServer {
               maxRecords: this.config.maxVaultRecords,
               maxBytes: this.config.maxVaultBytes,
               maxTotalBytes: this.config.maxTotalBytes,
+              maxVaults: this.config.maxVaults,
             });
             if (first === null) {
               this.sendWs(conn.ws, VAULT_DELETED);
@@ -507,6 +528,12 @@ export class SyncServer {
 
   private hello(conn: Connection, version: number, vault: Buffer, lastSeq: number): void {
     if (conn.room) throw new ProtocolError(ErrorCode.badRequest, 'HELLO doppelt');
+    if (conn.challenge) {
+      throw new ProtocolError(
+        ErrorCode.authRequired,
+        'Dieser Server verlangt einen Server-Schlüssel (in den Einstellungen der Synchronisation eintragen; ältere Apps bitte aktualisieren)',
+      );
+    }
     if (version !== PROTOCOL_VERSION) {
       throw new ProtocolError(ErrorCode.unsupportedVersion, `Protokoll ${version} unbekannt`);
     }
@@ -530,6 +557,13 @@ export class SyncServer {
     // läuft außerhalb, sonst hielte ein langsamer Client PUSH/ACK aller
     // anderen Geräte des Vaults auf.
     this.runIn(conn, r, async () => {
+      // Server voll: neue (und leere) Vaults schon hier abweisen, nicht erst
+      // beim ersten PUSH – so erfährt es der Nutzer beim Einrichten.
+      const maxVaults = this.config.maxVaults;
+      if (maxVaults > 0) {
+        const known = await this.store.head(r.id);
+        if (known.seq === 0 && !known.deleted && (await this.store.vaultCount()) >= maxVaults) throw serverFull();
+      }
       // Erst anlegen, dann lesen: So trägt schon das erste SYNCED die Epoche,
       // die auch nach dem ersten PUSH noch gilt.
       await this.store.touch(r.id);

@@ -32,6 +32,9 @@ services:
       DB_USER: antatime
       DB_PASSWORD: antatime
       DB_NAME: antatime
+      # Optional: Zugang beschränken (siehe README „Zugang beschränken“)
+      SERVER_PRIVATE_KEY: ${SERVER_PRIVATE_KEY:-}
+      MAX_VAULTS: ${MAX_VAULTS:-0}
     # Hinter einem Reverse-Proxy auf demselben Rechner besser nur lokal binden:
     #   "127.0.0.1:${SERVER_PORT:-8080}:8080"
     ports:
