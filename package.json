@@ -1,6 +1,6 @@
 {
   "name": "antatime-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Ende-zu-Ende-verschlüsselter Sync-Server für AnTaTime",
   "private": true,
   "type": "module",
